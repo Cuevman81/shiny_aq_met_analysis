@@ -80,4 +80,4 @@ This application relies on publicly available data from the following sources:
 ## Author
 
 *   **Rodney Cuevas**
-*   For bug reports or questions, please contact [RCuevas@mdeq.ms.gov](mailto:RCuevas@mdeq.ms.gov).
+*   For bug reports or questions, please contact [RCuevas@mdeq.ms.gov](mailto:RCuevas@mdeq.ms.gov). 
