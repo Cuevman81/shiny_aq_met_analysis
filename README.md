@@ -17,7 +17,7 @@ An R Shiny application for site-specific analysis of air quality and meteorologi
     -   Pollution and Wind Roses
     -   Time Series and Trend Plots (Theil-Sen, ggplot)
     -   Scatter Plots and Correlation Matrices
-    -   And many more...
+    -   And many more....
 -   **Statistical Summaries**: Provides a detailed statistics tab with descriptive stats, AQI category breakdowns, and diurnal patterns.
 -   **Data Export**: Allows you to download the final merged dataset as a CSV and all generated plots as a ZIP archive.
 
