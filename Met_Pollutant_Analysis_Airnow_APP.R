@@ -103,19 +103,23 @@ load_aqs_sites_data_refactored <- function() {
   if (!file.exists(local_csv_path)) {
     print(paste("Attempting download for AQS sites:", aqs_sites_zip_url))
     download_ok <- FALSE
+    
+    # --- MODIFICATION START: Use download.file with a much longer timeout ---
     tryCatch({
-      req_dl <- httr::GET(aqs_sites_zip_url, httr::write_disk(local_zip_path, overwrite = TRUE), httr::timeout(120), httr::progress())
-      if (httr::status_code(req_dl) == 200) {
+      # Increase timeout to 600 seconds (10 minutes) for this large file
+      # Using method="curl" is generally more robust across platforms
+      result <- download.file(aqs_sites_zip_url, destfile = local_zip_path, mode = "wb", quiet = FALSE, method = "curl", extra = "-L", timeout = 600)
+      
+      if (result == 0 && file.exists(local_zip_path)) {
         print("AQS Sites ZIP downloaded successfully.")
         download_ok <- TRUE
       } else {
-        warning(paste("AQS Sites ZIP download failed. Status:", httr::status_code(req_dl)), immediate. = TRUE)
-        return(NULL) # Exit if download fails
+        warning(paste("AQS Sites ZIP download failed. download.file status:", result), immediate. = TRUE)
       }
     }, error = function(e) {
       warning(paste("AQS Sites ZIP download error:", e$message), immediate. = TRUE)
-      return(NULL) # Exit on error
     })
+    # --- MODIFICATION END ---
     
     if (download_ok && file.exists(local_zip_path)) {
       print("Unzipping AQS sites data...")
@@ -124,16 +128,15 @@ load_aqs_sites_data_refactored <- function() {
         print("AQS Sites data unzipped successfully.")
       }, error = function(e) {
         warning(paste("Failed to unzip AQS sites data:", e$message), immediate. = TRUE)
-        if (file.exists(local_csv_path)) try(file.remove(local_csv_path), silent = TRUE) # Clean up if partial extraction
-        return(NULL) # Exit if unzip fails
+        if (file.exists(local_csv_path)) try(file.remove(local_csv_path), silent = TRUE)
+        return(NULL)
       })
     } else if (!download_ok) {
-      # This case should be caught by return(NULL) in download tryCatch, but as a safeguard:
       warning("AQS Sites ZIP download was not successful, cannot proceed with unzipping.", immediate. = TRUE)
       return(NULL)
-    } # No specific 'else' needed if download_ok is true but local_zip_path doesn't exist (should not happen if download_ok is true)
+    }
     
-    if (file.exists(local_zip_path)) try(file.remove(local_zip_path), silent = TRUE) # Clean up zip file
+    if (file.exists(local_zip_path)) try(file.remove(local_zip_path), silent = TRUE)
     
   } else {
     print(paste("Using existing AQS sites CSV:", local_csv_path))
@@ -142,8 +145,7 @@ load_aqs_sites_data_refactored <- function() {
   if (file.exists(local_csv_path)) {
     print("Reading and processing AQS Sites CSV...")
     tryCatch({
-      # Increased guess_max for this large file
-      sites_df_raw <- readr::read_csv(local_csv_path, show_col_types = FALSE, progress = FALSE, guess_max = 150000) 
+      sites_df_raw <- readr::read_csv(local_csv_path, show_col_types = FALSE, progress = FALSE, guess_max = 150000)
       
       req_cols <- c("State Code", "County Code", "Site Number", "Latitude", "Longitude", 
                     "GMT Offset", "State Name", "County Name", "Local Site Name")
@@ -155,15 +157,13 @@ load_aqs_sites_data_refactored <- function() {
       
       sites_df <- sites_df_raw %>%
         mutate(
-          # Convert ID components to numeric/integer first for reliable NA handling and formatting
           `State Code Num` = suppressWarnings(as.integer(`State Code`)),
           `County Code Num` = suppressWarnings(as.integer(`County Code`)),
           `Site Number Num` = suppressWarnings(as.integer(`Site Number`)),
           Latitude = suppressWarnings(as.numeric(Latitude)),
           Longitude = suppressWarnings(as.numeric(Longitude)),
-          `GMT Offset Num` = suppressWarnings(as.numeric(`GMT Offset`)) # Keep as numeric for case_when
+          `GMT Offset Num` = suppressWarnings(as.numeric(`GMT Offset`))
         ) %>%
-        # Format codes after ensuring they are integers; NA will remain NA_character_
         mutate(
           `State Code Fmt` = if_else(is.na(`State Code Num`), NA_character_, sprintf("%02d", `State Code Num`)),
           `County Code Fmt` = if_else(is.na(`County Code Num`), NA_character_, sprintf("%03d", `County Code Num`)),
@@ -174,40 +174,31 @@ load_aqs_sites_data_refactored <- function() {
           InferredTZ = case_when(
             !is.na(`GMT Offset Num`) & `GMT Offset Num` == -10 ~ "Pacific/Honolulu",
             !is.na(`GMT Offset Num`) & `GMT Offset Num` == -9  ~ "America/Anchorage",
-            !is.na(`GMT Offset Num`) & `GMT Offset Num` == -8  ~ "America/Los_Angeles", # PST
-            !is.na(`GMT Offset Num`) & `GMT Offset Num` == -7  ~ "America/Denver",      # MST/PDT
-            !is.na(`GMT Offset Num`) & `GMT Offset Num` == -6  ~ "America/Chicago",     # CST/MDT
-            !is.na(`GMT Offset Num`) & `GMT Offset Num` == -5  ~ "America/New_York",    # EST/CDT
-            !is.na(`GMT Offset Num`) & `GMT Offset Num` == -4  ~ "America/Puerto_Rico", # AST/EDT
-            TRUE ~ "UTC" # Default or if GMT Offset Num is NA/unhandled
+            !is.na(`GMT Offset Num`) & `GMT Offset Num` == -8  ~ "America/Los_Angeles",
+            !is.na(`GMT Offset Num`) & `GMT Offset Num` == -7  ~ "America/Denver",
+            !is.na(`GMT Offset Num`) & `GMT Offset Num` == -6  ~ "America/Chicago",
+            !is.na(`GMT Offset Num`) & `GMT Offset Num` == -5  ~ "America/New_York",
+            !is.na(`GMT Offset Num`) & `GMT Offset Num` == -4  ~ "America/Puerto_Rico",
+            TRUE ~ "UTC"
           )
         ) %>%
-        # Filter based on critical information
         filter(
-          !is.na(AQSID) & nchar(AQSID) == 9, # Ensure valid AQSID format
+          !is.na(AQSID) & nchar(AQSID) == 9,
           !is.na(Latitude) & !is.na(Longitude),
-          (Latitude != 0 | Longitude != 0), # Allow 0 if the other is non-zero, effectively excluding 0,0
+          (Latitude != 0 | Longitude != 0),
           !is.na(`State Name`) & `State Name` != "",
           !is.na(`County Name`) & `County Name` != "",
           !is.na(`Local Site Name`) & `Local Site Name` != ""
         ) %>%
-        # Create SiteNameID using the formatted site number for consistency
         mutate(SiteNameID = paste(`Local Site Name`, "-", `Site Number Fmt`)) %>%
-        # Select original and newly created/formatted columns as needed by the rest of the app
-        # Retain original State Code, County Code, Site Number if they are used elsewhere as characters directly
-        # For this example, I'm assuming the formatted ones and AQSID are primary.
         select(
-          `State Code` = `State Code Fmt`, # Replace original with formatted
+          `State Code` = `State Code Fmt`,
           `County Code` = `County Code Fmt`,
           `Site Number` = `Site Number Fmt`,
           AQSID, SiteNameID, Latitude, Longitude, 
-          `GMT Offset` = `GMT Offset Num`, # Use the numeric version
+          `GMT Offset` = `GMT Offset Num`,
           InferredTZ, 
           `State Name`, `County Name`, `Local Site Name`
-          # Add back original character versions if they are used elsewhere:
-          # `State Code Char` = `State Code`, 
-          # `County Code Char` = `County Code`, 
-          # `Site Number Char` = `Site Number`
         )
       
       print("AQS Sites processing completed successfully.")
