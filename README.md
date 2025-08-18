@@ -2,7 +2,7 @@
 
 An R Shiny application for site-specific analysis of air quality and meteorological data. This tool downloads, merges, and visualizes data from official sources like AirNow, NOAA, and IEM, providing a comprehensive toolkit for environmental data exploration.
 
-![App Screenshot](app-screenshot.png)
+![App Screenshot](CalendarPlot.png)
 
 ## Key Features
 
