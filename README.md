@@ -32,14 +32,23 @@ This application is built with the R Shiny framework. To run it locally, you wil
 
 ### 2. Installation
 
-First, clone this repository to your local machine:
+First, open a **Terminal** or **Shell**.
+*(Note: Do not run these commands in the R Console).*
+
+Navigate to the directory where you want to store the project (e.g., your Documents folder) and then clone the repository:
 
 ```bash
+# Example: navigate to your Documents folder
+cd Documents
+
+# Now, clone the project
 git clone https://github.com/Cuevman81/shiny_aq_met_analysis.git
+
+# Navigate into the newly created project folder
 cd shiny_aq_met_analysis
 ```
 
-Next, open the project in RStudio and run the following command in the R console to install all the required packages:
+Next, open the project in RStudio by double-clicking the `.Rproj` file. Run the following command in the **R Console** to install all the required packages:
 
 ```r
 install.packages(c(
