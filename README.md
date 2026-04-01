@@ -8,9 +8,10 @@ An R Shiny application for site-specific analysis of air quality and meteorologi
 
 -   **Dual Analysis Modes**: Supports both **Hourly** (AirNow + NOAA ISH) and **Daily** (AirNow + IEM ASOS) data analysis.
 -   **Site-Specific Selection**: Easily select any AQS monitoring site in the United States by state and county.
--   **Automated Data Fetching**: Downloads the latest pollutant and meteorological data directly from AirNow, NOAA, and IEM servers.
--   **Intelligent Caching**: Caches downloaded data to speed up subsequent analyses for the same site and date range.
--   **Nearby Station Finder**: Automatically finds the closest meteorological stations to your selected air quality monitor.
+-   **Local Standard Time (LST) Synchronization**: Strictly aligns all pollutants to a fixed Standard Time offset (e.g. UTC-6 for Central Standard), effectively matching EPA/AirNowTech regulatory formats.
+-   **"Hour Ending" Weather Alignment**: Automatically shifts metallurgical observations (snap-shots) forward by one hour to perfectly match the 1-hour average of the pollutant data.
+-   **Nearby Station Finder**: Automatically suggests the closest meteorological stations using geosphere-based distance calculations.
+-   **Robust Data Fetching**: Expanded UTC windows ensure 24-hour coverage for any selected local day, including real-time IEM ASOS and long-term NOAA ISH data.
 -   **Comprehensive Visualizations**: Generates a wide array of publication-quality plots using the powerful `openair` package, including:
     -   Calendar Plots (with value and wind vector annotations)
     -   Polar Plots (concentration, CPF)
