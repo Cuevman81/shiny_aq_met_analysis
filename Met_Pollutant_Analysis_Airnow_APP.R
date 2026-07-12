@@ -1,13 +1,19 @@
 # =========================================================================
 # Shiny App for Site-Specific Pollutant & Meteorology Analysis
-# Version: 2024-04-09_Shiny_HourlyDaily
+# Version: 2026-07-12_Shiny_HourlyDaily
 # Supports Hourly (AirNow Hourly + NOAA ISH) & Daily (AirNow Daily + IEM ASOS)
 # =========================================================================
 
 # --- 1. Load Libraries ---
-# install.packages(c("shiny", "dplyr", "lubridate", "worldmet", "openair", "readr", "ggplot2", "gridExtra", "grid", "viridis", "padr", "httr", "purrr", "future", "furrr", "DT", "shinycssloaders", "shinyjs", "zip", "glue"))
+# install.packages(c("shiny", "bslib", "bsicons", "leaflet", "Hmisc", "dplyr",
+#   "digest", "lubridate", "worldmet", "openair", "readr", "ggplot2",
+#   "gridExtra", "grid", "viridis", "padr", "httr", "purrr", "future", "furrr",
+#   "DT", "shinycssloaders", "shinyjs", "zip", "glue", "tidyr", "mgcv",
+#   "RColorBrewer", "geosphere", "quantreg"))
 library(shiny)
 library(bslib)
+library(bsicons)   # For bs_icon() used in value boxes / alerts
+library(leaflet)   # For the interactive site & MET station map
 library(dplyr)
 library(digest)
 library(lubridate)
@@ -33,6 +39,7 @@ library(mgcv)
 library(RColorBrewer)
 library(geosphere)
 library(quantreg)
+# NOTE: Hmisc is used via Hmisc::capitalize() (namespaced) to avoid masking dplyr.
 
 # --- 2. Global Setup ---
 
@@ -88,6 +95,11 @@ plot_choices <- list(
     "Kernel Density Exceedance" = "kernelexceed"
   )
 )
+
+# Plot values that require hourly (wind/diurnal) data. Defined globally so BOTH
+# the Run observer (auto-save) and the plot-rendering UI can reference it.
+hourly_only_plot_values <- c("windrose", "polrose", "polar", "polarannulus",
+                             "percentilerose", "polarcluster", "stability")
 
 
 # --- Download and Load AQS Sites Data (REVISED) ---
@@ -422,31 +434,33 @@ fetch_and_cache_met_data <- function(met_code, start_d, end_d, data_type_mode, s
   
   # --- MET Data Fetching Logic ---
   data_r <- NULL
+  met_source_used <- NA_character_  # Track which source actually supplied the data
   if (data_type_mode == "hourly") {
     # Check if we should use IEM ASOS (for recent data) or NOAA ISH
     # If the end date is within 4 days of today, NOAA ISH likely has a lag.
     is_recent <- as.numeric(Sys.Date() - end_d) <= 4
-    
+
     if (is_recent) {
       rv_log_update(" > INFO: Recent dates selected. Using IEM ASOS (Real-time) instead of NOAA ISH to bypass lag.")
       # Find the call sign and state for this code
       station_info <- us_ish_stations %>% filter(code == met_code) %>% head(1)
       station_call_sign <- station_info$call
       station_state <- station_info$state
-      
+
       if (!is.null(station_call_sign) && length(station_call_sign) > 0 && nchar(station_call_sign) >= 3) {
         data_r <- fetch_process_iem_hourly_met(station_call_sign, station_state, start_d, end_d, plot_dir)
         if (!is.null(data_r) && nrow(data_r) > 0) {
+          met_source_used <- "IEM ASOS (Real-time)"
           rv_log_update(paste(" > SUCCESS: Fetched", nrow(data_r), "hourly rows from IEM ASOS (", station_call_sign, ")."))
         }
       }
     }
-    
+
     # Fallback to NOAA ISH if IEM failed or if data is not "recent"
     if (is.null(data_r) || nrow(data_r) == 0) {
       if (is_recent) rv_log_update(" > WARNING: IEM fallback failed. Attempting NOAA ISH...")
       else rv_log_update(" > INFO: Using NOAA ISH (Quality Controlled) source.")
-      
+
       met_data_list <- list()
       # Expand year range slightly to cover potential timezone wraps
       for (yr in year(start_d - days(1)):year(end_d + days(1))) {
@@ -459,6 +473,7 @@ fetch_and_cache_met_data <- function(met_code, start_d, end_d, data_type_mode, s
         data_r <- bind_rows(met_data_list)
         # --- MODIFICATION: Rename columns to match openair standards ---
         if (!is.null(data_r) && nrow(data_r) > 0) {
+          met_source_used <- "NOAA ISH (Quality Controlled)"
           data_r <- data_r %>%
             rename_with(~"temp", any_of("air_temp")) %>%
             rename_with(~"rh", any_of("RH"))
@@ -470,8 +485,15 @@ fetch_and_cache_met_data <- function(met_code, start_d, end_d, data_type_mode, s
       station_id = met_code, start_date = start_d, end_date = end_d,
       met_state_abbr = met_state_abbr, met_dir = plot_dir
     )
+    if (!is.null(data_r) && nrow(data_r) > 0) met_source_used <- "IEM ASOS (Daily)"
   }
-  
+
+  # Tag the returned data with the source so the UI can report it.
+  # Attributes survive saveRDS/readRDS, so cached data keeps this label too.
+  if (!is.null(data_r) && nrow(data_r) > 0) {
+    attr(data_r, "met_source") <- met_source_used
+  }
+
   # --- Save to cache if data was successfully fetched ---
   if (!is.null(data_r) && nrow(data_r) > 0) {
     tryCatch({
@@ -481,7 +503,7 @@ fetch_and_cache_met_data <- function(met_code, start_d, end_d, data_type_mode, s
       rv_log_update(paste(" > WARNING: Failed to save MET data to cache:", e$message))
     })
   }
-  
+
   return(data_r)
 }
 
@@ -541,9 +563,6 @@ get_us_ish_metadata <- function(cache_dir = "app_data") {
   warning("Failed to download any MET station metadata from worldmet.", immediate. = TRUE)
   return(NULL)
 }
-
-# Pre-load the metadata when the app starts
-us_ish_stations <- get_us_ish_metadata()
 
 # Fetch and cache the full ASOS station metadata for the US from IEM
 get_us_asos_metadata <- function(cache_dir = "app_data") {
@@ -630,13 +649,18 @@ get_airnow_hourly_url <- function(timestamp_gmt, base_url) {
 read_and_process_airnow_hourly <- function(url, target_aqs_id, target_param, target_tz, target_lat, target_lon) {
   col_names <- c("vd", "vt", "aqsid", "site", "gmt_off", "param", "units", "val", "src")
   col_types_spec <- cols(.default = col_character(), val = col_double())
-  
+
+  # NOTE: We deliberately do NOT map warnings to NULL here. read_delim emits
+  # benign parsing warnings on otherwise-valid AirNow files; discarding the
+  # whole hour on any warning silently drops good data. We only treat genuine
+  # read errors (e.g. missing 404/403 files) as "no data".
   data <- tryCatch({
-    read_delim(url, "|", col_names = col_names, col_types = col_types_spec, 
-               trim_ws = TRUE, locale = locale(encoding = "UTF-8"), 
-               progress = FALSE, guess_max = 5000)
-  }, warning = function(w) { NULL }, 
-     error = function(e) {
+    suppressWarnings(
+      read_delim(url, "|", col_names = col_names, col_types = col_types_spec,
+                 trim_ws = TRUE, locale = locale(encoding = "UTF-8"),
+                 progress = FALSE, guess_max = 5000)
+    )
+  }, error = function(e) {
        if (!grepl("404|403", e$message)) {
          warning(paste("ERR reading URL:", url, e$message), call. = FALSE)
        }
@@ -684,11 +708,15 @@ read_process_airnow_daily <- function(url, target_aqs_id, target_param_name, tar
                          aqi = col_integer(), aqi_category = col_integer(),
                          latitude_daily = col_double(), longitude_daily = col_double())
   
+  # See read_and_process_airnow_hourly: suppress benign parse warnings rather
+  # than discarding the whole day's data on any warning.
   data <- tryCatch({
-    read_delim(url, "|", col_names = col_names, col_types = col_types_spec,
-               trim_ws = TRUE, locale = locale(encoding = "UTF-8"),
-               progress = FALSE, guess_max = 10000)
-  }, warning = function(w) { NULL }, error = function(e) {
+    suppressWarnings(
+      read_delim(url, "|", col_names = col_names, col_types = col_types_spec,
+                 trim_ws = TRUE, locale = locale(encoding = "UTF-8"),
+                 progress = FALSE, guess_max = 10000)
+    )
+  }, error = function(e) {
     if (!grepl("404|403", e$message)) { warning(paste("ERR reading Daily URL:", url, e$message), call. = FALSE) }
     NULL
   })
@@ -1026,6 +1054,18 @@ assess_data_quality <- function(df, poll_col, met_cols = c("ws", "wd", "temp", "
   return(quality_report)
 }
 
+# UI helper: renders a small "Select all | Clear" control for a checkbox group.
+# The action links are wired up to updateCheckboxGroupInput in the server.
+select_all_none <- function(group_id) {
+  tags$div(
+    class = "mb-1",
+    style = "font-size: 0.8em;",
+    actionLink(paste0(group_id, "_all"), "Select all"),
+    tags$span(" | ", style = "color:#adb5bd;"),
+    actionLink(paste0(group_id, "_none"), "Clear")
+  )
+}
+
 # Plot Saving Helpers
 save_and_print_plot <- function(plot_obj_func, filename, show_plot=TRUE, ...) { tryCatch({ png(filename,...); plot_obj_func(); dev.off() }, error=function(e){warning(paste("Fail save:",basename(filename)),call.=FALSE)}); if(show_plot){tryCatch({plot_obj_func()},error=function(e){})}; Sys.sleep(0.05) }
 save_and_print_ggplot <- function(plot_obj, filename, show_plot=TRUE, ...) { tryCatch({ ggsave(filename, plot=plot_obj, ...) }, error=function(e){warning(paste("Fail save ggplot:",basename(filename)),call.=FALSE)}); if(show_plot){tryCatch({print(plot_obj)},error=function(e){})}; Sys.sleep(0.05) }
@@ -1105,21 +1145,25 @@ ui <- page_sidebar(
       accordion_panel("5. Plots to Generate", value = "Plots",
                       # Categorized Plot Selection
                       h6("Select Plots to Generate:", class="mt-3"),
-                      checkboxGroupInput("plots_select_temporal", "Temporal Trends (Both)", 
-                                         choices = plot_choices[[1]], 
+
+                      select_all_none("plots_select_temporal"),
+                      checkboxGroupInput("plots_select_temporal", "Temporal Trends (Both)",
+                                         choices = plot_choices[[1]],
                                          selected = c("calendar", "timeseries")),
-                      
+
                       conditionalPanel(
                         condition = "input.data_type == 'hourly'",
-                        checkboxGroupInput("plots_select_met", "Meteorological (Hourly Only)", 
-                                           choices = plot_choices[[2]], 
+                        select_all_none("plots_select_met"),
+                        checkboxGroupInput("plots_select_met", "Meteorological (Hourly Only)",
+                                           choices = plot_choices[[2]],
                                            selected = c("windrose", "polar"))
                       ),
-                      
-                      checkboxGroupInput("plots_select_stat", "Statistical & Diagnostic (Both)", 
-                                         choices = plot_choices[[3]], 
+
+                      select_all_none("plots_select_stat"),
+                      checkboxGroupInput("plots_select_stat", "Statistical & Diagnostic (Both)",
+                                         choices = plot_choices[[3]],
                                          selected = c("summary", "scatter_met"))
- 
+
      ) # End accordion_panel 5
     ), # End sidebar_accordion
     
@@ -1152,6 +1196,10 @@ ui <- page_sidebar(
     nav_panel("Merged Data", icon = icon("table"), card_body(fillable = FALSE, layout_sidebar(
       sidebar = sidebar(width = 200, position = "right", downloadButton("download_merged_data", "Download CSV", class = "btn-primary btn-sm w-100")),
       h4("Preview of Merged Data"), withSpinner(DT::dataTableOutput("merged_data_table"))))),
+    nav_panel("Site Map", icon = icon("map-location-dot"), card_body(
+      h4("AQS Site & Nearby MET Stations"),
+      tags$p("The selected air-quality site is shown in red; candidate MET stations are shown in blue with their distance. Use this to sanity-check the site-to-station pairing."),
+      withSpinner(leaflet::leafletOutput("site_map", height = "600px")))),
     nav_panel("Selected Plots", icon = icon("chart-line"), card_body(fillable = FALSE, layout_sidebar(
       sidebar = sidebar(width = 200, position = "right",
                         downloadButton("download_all_plots", "Download All Plots (ZIP)", class = "btn-primary btn-sm w-100 mb-2"),
@@ -1159,9 +1207,10 @@ ui <- page_sidebar(
       h4("Generated Visualizations"), tags$p("Plots selected will appear below."), withSpinner(uiOutput("plots_dynamic_ui"))))),
     nav_panel("Statistics", icon = icon("calculator"), card_body(
       layout_columns(col_widths = c(3, 3, 3, 3), fill = FALSE,
-                     uiOutput("stat_value_box_pollutant"), uiOutput("stat_value_box_exceedances"),
-                     uiOutput("stat_value_box_ws"), uiOutput("stat_value_box_completeness")),
+                     withSpinner(uiOutput("stat_value_box_pollutant")), withSpinner(uiOutput("stat_value_box_exceedances")),
+                     withSpinner(uiOutput("stat_value_box_ws")), withSpinner(uiOutput("stat_value_box_completeness"))),
       tags$hr(),
+      uiOutput("met_source_banner"),
       h4("Detailed Statistics"), tags$p("Statistics based on the merged data for the selected period."),
       withSpinner(uiOutput("statistics_dynamic_ui"))))
   )
@@ -1183,8 +1232,47 @@ server <- function(input, output, session) {
     current_pollutant_colname = NULL, # e.g., OZONE, OZONE_8HR_PPB
     current_datatype = "hourly", # Track current mode
     current_breaks = NULL, current_labels = NULL, current_colors = NULL,
+    met_source = NULL,      # Which source supplied MET data (IEM / NOAA)
+    met_distance_km = NULL, # Distance from AQS site to chosen MET station
+    met_station_label = NULL, # Human-readable MET station name/id
     run_trigger = 0
   )
+
+  # --- Select all / Clear handlers for the three plot checkbox groups ---
+  # Each group has "<id>_all" and "<id>_none" action links defined in the UI.
+  plot_group_choices <- list(
+    plots_select_temporal = plot_choices[[1]],
+    plots_select_met      = plot_choices[[2]],
+    plots_select_stat     = plot_choices[[3]]
+  )
+  lapply(names(plot_group_choices), function(gid) {
+    observeEvent(input[[paste0(gid, "_all")]], {
+      updateCheckboxGroupInput(session, gid, selected = unname(plot_group_choices[[gid]]))
+    }, ignoreInit = TRUE)
+    observeEvent(input[[paste0(gid, "_none")]], {
+      updateCheckboxGroupInput(session, gid, selected = character(0))
+    }, ignoreInit = TRUE)
+  })
+
+  # --- Reactive: nearby MET stations for the current site + data type ---
+  # Shared by the MET-station dropdown and the Site Map so the logic lives once.
+  nearby_met_stations <- reactive({
+    aqi_site_info <- rv$selected_site_info
+    req(aqi_site_info, input$data_type)
+    if (input$data_type == "hourly") {
+      find_nearby_stations(aqi_site_info$lat, aqi_site_info$lon, us_ish_stations)
+    } else {
+      find_nearby_stations(aqi_site_info$lat, aqi_site_info$lon, us_asos_stations)
+    }
+  })
+
+  # --- Gate the Run button until a site AND a MET station are chosen ---
+  observe({
+    site_ok <- !is.null(input$site_select) && nchar(input$site_select) > 0
+    met_ok <- (!is.null(input$met_station_select) && nchar(input$met_station_select) > 0) ||
+              (!is.null(input$met_code_input) && nchar(trimws(input$met_code_input)) >= 3)
+    if (site_ok && met_ok) shinyjs::enable("run_button") else shinyjs::disable("run_button")
+  })
   
   # --- Initial UI State ---
   observe({
@@ -1599,6 +1687,21 @@ server <- function(input, output, session) {
       if (is.null(met_data_result) || nrow(met_data_result) == 0) {
         showNotification(paste("No MET data found for station", met_code), type="warning"); return()
       }
+
+      # --- Capture MET provenance (source + distance) for the Statistics tab ---
+      rv$met_source <- attr(met_data_result, "met_source")
+      rv$met_station_label <- met_code
+      rv$met_distance_km <- tryCatch({
+        stn <- if (data_type_mode == "hourly") {
+          us_ish_stations %>% filter(code == met_code) %>% slice(1)
+        } else {
+          us_asos_stations %>% filter(station_id == met_code) %>% slice(1)
+        }
+        if (nrow(stn) == 1 && !is.na(site_info$lat) && !is.na(site_info$lon)) {
+          as.numeric(distHaversine(c(site_info$lon, site_info$lat), c(stn$lon, stn$lat)) / 1000)
+        } else NA_real_
+      }, error = function(e) NA_real_)
+
       # --- 5. TIME CONVERSION & SYNCHRONIZATION ---
       rv$status_log <- tail(c(rv$status_log, "3. Synchronizing Hourly Timestamps..."), 20)
       
@@ -1650,54 +1753,103 @@ server <- function(input, output, session) {
          all_selected <- all_selected[!all_selected %in% hourly_only_plot_values]
       }
       
-      # Helper for saving
-      save_plot_auto <- function(plot_obj, filename_base) {
-        if (is.null(plot_obj)) return()
+      # Format-aware save helper. `plot_fun` is a closure that either draws to
+      # the open device as a side effect (openair / base graphics) OR returns a
+      # ggplot object which we then print. Honors PNG / PDF / SVG.
+      save_plot_auto <- function(filename_base, plot_fun) {
+        fmt <- input$download_format
+        if (!fmt %in% c("png", "pdf", "svg")) fmt <- "png"
+        out_file <- file.path(rv$plot_dir, paste0(filename_base, ".", fmt))
         try({
-          file_ext <- if (input$download_format == "pdf") ".pdf" else ".png"
-          out_file <- file.path(rv$plot_dir, paste0(filename_base, file_ext))
-          
-          if (file_ext == ".pdf") {
-             pdf(out_file, width = 11, height = 8.5)
-             print(plot_obj)
-             dev.off()
+          if (fmt == "pdf") {
+            grDevices::pdf(out_file, width = 11, height = 8.5)
+          } else if (fmt == "svg") {
+            grDevices::svg(out_file, width = 11, height = 8.5)
           } else {
-             png(out_file, width = 1200, height = 900, res = 120)
-             print(plot_obj)
-             dev.off()
+            grDevices::png(out_file, width = 1200, height = 900, res = 120)
           }
+          on.exit(grDevices::dev.off(), add = TRUE)
+          res <- plot_fun()
+          # ggplot objects must be printed to draw; openair/base already drew.
+          if (inherits(res, c("gg", "ggplot"))) print(res)
         }, silent = TRUE)
       }
-      
-      # Logic to generate and save each selected plot (Re-run minimal versions for storage)
-      try({
-        df_save <- merged_data_result
-        poll_save <- rv$current_pollutant_colname
-        
-        if ("calendar" %in% all_selected) {
-           yr1 <- year(start_d)
-           p_cal1 <- calendarPlot(df_save, pollutant = poll_save, year = yr1, cols = rv$current_colors, breaks = rv$current_breaks)
-           save_plot_auto(p_cal1, paste0("Calendar_", yr1))
+
+      # Regenerate and save every SELECTED plot so the ZIP matches the screen.
+      # Each save is independently guarded, so one failure never blocks the rest.
+      df_save   <- merged_data_result
+      poll_save <- rv$current_pollutant_colname
+      site_tz   <- site_info$tz
+      brks      <- rv$current_breaks
+      labs      <- rv$current_labels
+      cols_aqi  <- rv$current_colors
+      sname     <- site_info$name_long
+
+      # Daily-max aggregation used by the calendar export (hourly mode)
+      daily_max_df <- function(d) {
+        if (data_type_mode != "hourly") return(as.data.frame(d))
+        d %>% mutate(.day = as.Date(date, tz = site_tz)) %>%
+          group_by(.day) %>%
+          summarise("{poll_save}" := if (all(is.na(.data[[poll_save]]))) NA_real_ else max(.data[[poll_save]], na.rm = TRUE),
+                    .groups = "drop") %>%
+          rename(date = .day) %>% as.data.frame()
+      }
+
+      if ("summary" %in% all_selected)
+        save_plot_auto("DataSummary", function() summaryPlot(df_save, pollutant = poll_save))
+      if ("calendar" %in% all_selected)
+        save_plot_auto("Calendar", function() calendarPlot(daily_max_df(df_save), pollutant = poll_save, cols = cols_aqi, breaks = brks, main = paste("Calendar", poll_save, "-", sname)))
+      if ("timeseries" %in% all_selected)
+        save_plot_auto("TimeSeries", function() timePlot(df_save, pollutant = poll_save, main = paste("Time Series", poll_save)))
+      if ("timevar" %in% all_selected && data_type_mode == "hourly")
+        save_plot_auto("TimeVariation", function() timeVariation(df_save, pollutant = poll_save))
+      if ("theilsen" %in% all_selected && length(unique(year(df_save$date))) > 1)
+        save_plot_auto("TheilSen", function() TheilSen(df_save, pollutant = poll_save, deseason = TRUE))
+      if ("trendlevel" %in% all_selected && data_type_mode == "hourly")
+        save_plot_auto("TrendLevel", function() trendLevel(df_save, pollutant = poll_save, x = "month", y = "hour", cols = cols_aqi, breaks = brks))
+      if ("timeprop" %in% all_selected) {
+        save_plot_auto("AQI_Proportions", function() {
+          df_p <- df_save %>% mutate(aqi_cat = cut(.data[[poll_save]], breaks = brks, labels = labs, include.lowest = TRUE, right = FALSE)) %>% filter(!is.na(aqi_cat))
+          timeProp(df_p, pollutant = "aqi_cat", avg.time = "week", cols = cols_aqi, key.columns = 3)
+        })
+      }
+      if ("scatter_met" %in% all_selected && "temp" %in% names(df_save))
+        save_plot_auto("Scatter_Temp", function() ggplot(df_save, aes(x = temp, y = .data[[poll_save]])) + geom_point(alpha = 0.3, size = 1) + geom_smooth(method = "gam", formula = y ~ s(x, k = 5), na.rm = TRUE) + theme_light() + labs(title = paste(poll_save, "vs Temp -", sname)))
+      if ("corr" %in% all_selected) {
+        save_plot_auto("Correlation", function() {
+          cc <- intersect(c(poll_save, "ws", "wd", "temp", "rh"), names(df_save))
+          if (length(cc) >= 2) corPlot(df_save[, cc], pollutants = cc)
+        })
+      }
+      if ("kernelexceed" %in% all_selected && all(c("ws", "wd") %in% names(df_save)))
+        save_plot_auto("KernelExceed", function() try(kernelExceed(df_save, x = poll_save), silent = TRUE))
+
+      # Meteorological / source plots (hourly only)
+      if (data_type_mode == "hourly") {
+        if ("windrose" %in% all_selected && all(c("ws", "wd") %in% names(df_save)))
+          save_plot_auto("WindRose", function() windRose(df_save, main = paste("Wind Rose -", sname)))
+        if ("polrose" %in% all_selected && all(c("ws", "wd") %in% names(df_save)))
+          save_plot_auto("PollutionRose", function() pollutionRose(df_save, pollutant = poll_save, breaks = brks, cols = cols_aqi))
+        if ("polar" %in% all_selected && all(c("ws", "wd") %in% names(df_save)))
+          save_plot_auto("PolarPlot", function() polarPlot(df_save, pollutant = poll_save, statistic = "mean", cols = "viridis", main = paste("Mean", poll_save, "by Wind -", sname)))
+        if ("polarannulus" %in% all_selected && all(c("ws", "wd", "temp") %in% names(df_save)))
+          save_plot_auto("PolarAnnulus", function() polarAnnulus(df_save, pollutant = poll_save, variable = "temp"))
+        if ("percentilerose" %in% all_selected && all(c("ws", "wd") %in% names(df_save)))
+          save_plot_auto("PercentileRose", function() percentileRose(df_save, pollutant = poll_save, percentile = c(50, 95, 99), col = "Set1"))
+        if ("polarcluster" %in% all_selected && all(c("ws", "wd") %in% names(df_save)))
+          save_plot_auto("PolarCluster", function() polarCluster(df_save, pollutant = poll_save, n.clusters = 6, cols = "Set1"))
+        if ("stability" %in% all_selected && all(c("ws") %in% names(df_save))) {
+          save_plot_auto("Stability", function() {
+            ds <- calculate_stability(df_save)
+            ds$stability <- factor(ds$stability, levels = c("Very Unstable", "Unstable", "Slightly Unstable", "Neutral", "Slightly Stable", "Stable", "Very Stable", "Unknown"))
+            ggplot(ds, aes(x = stability, y = .data[[poll_save]], fill = stability)) + geom_boxplot(na.rm = TRUE) +
+              scale_fill_brewer(palette = "RdYlBu", drop = FALSE) + theme_minimal() +
+              theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") +
+              labs(title = paste(poll_save, "by Atmospheric Stability -", sname))
+          })
         }
-        if ("polar" %in% all_selected && data_type_mode == "hourly") {
-           p_pol <- polarPlot(df_save, pollutant = poll_save, main = "Bivariate Polar Plot")
-           save_plot_auto(p_pol, "PolarPlot")
-        }
-        if ("timevar" %in% all_selected) {
-           p_tv <- timeVariation(df_save, pollutant = poll_save)
-           save_plot_auto(p_tv, "TimeVariation")
-        }
-        if ("summary" %in% all_selected) {
-           p_sum <- summaryPlot(df_save, pollutant = poll_save)
-           save_plot_auto(p_sum, "DataSummary")
-        }
-        if ("timeprop" %in% all_selected) {
-           df_p <- df_save %>% mutate(aqi_cat = cut(.data[[poll_save]], breaks = rv$current_breaks, labels = rv$current_labels))
-           p_prop <- timeProp(df_p, pollutant = "aqi_cat", cols = rv$current_colors)
-           save_plot_auto(p_prop, "AQI_Proportions")
-        }
-      }, silent = TRUE)
-      
+      }
+
       rv$status_log <- tail(c(rv$status_log, "--- Analysis & Export Complete ---"), 20)
       
     }, error = function(e) {
@@ -1716,17 +1868,17 @@ server <- function(input, output, session) {
     rv$merged_data <- NULL
     rv$status_log <- c("Analysis reset.")
     rv$plot_dir <- NULL
-    
+    rv$met_source <- NULL
+    rv$met_distance_km <- NULL
+    rv$met_station_label <- NULL
+
     updateCheckboxGroupInput(session, "plots_select_temporal", selected = c("calendar", "timeseries"))
     updateCheckboxGroupInput(session, "plots_select_met", selected = c("windrose", "polar"))
     updateCheckboxGroupInput(session, "plots_select_stat", selected = c("summary", "scatter_met"))
-    
+
     showNotification("Analysis reset. Ready for new run.", type = "message")  # CHANGED FROM "info" TO "message"
   })
-  
-  # --- Render Outputs ---
-  output$status_output <- renderText({ paste(tail(rv$status_log, 20), collapse="\n") })
-  
+
   # In the "Render Outputs" section
   output$merged_data_table <- DT::renderDataTable({
     # Use the reactive VALUE `rv$merged_data`
@@ -1865,7 +2017,58 @@ server <- function(input, output, session) {
       p("Relative to merged data rows")
     )
   })
-  
+
+  # --- MET data provenance banner (source + station distance) ---
+  output$met_source_banner <- renderUI({
+    req(rv$merged_data, rv$met_source)
+    dist_txt <- if (!is.null(rv$met_distance_km) && !is.na(rv$met_distance_km)) {
+      sprintf(" · %.1f km from AQS site", rv$met_distance_km)
+    } else ""
+    tags$div(
+      class = "alert alert-info",
+      style = "font-size: 0.9em; padding: 8px 12px;",
+      bsicons::bs_icon("broadcast-pin"),
+      tags$strong(" MET source: "), rv$met_source,
+      tags$span(sprintf(" (station %s%s)", rv$met_station_label %||% "?", dist_txt))
+    )
+  })
+
+  # --- Site Map: AQS site (red) + nearby MET stations (blue) ---
+  output$site_map <- leaflet::renderLeaflet({
+    site <- rv$selected_site_info
+    validate(need(!is.null(site), "Select an AQS site to view the map."))
+
+    m <- leaflet::leaflet() %>%
+      leaflet::addTiles() %>%
+      leaflet::addCircleMarkers(
+        lng = site$lon, lat = site$lat,
+        color = "red", fillColor = "red", fillOpacity = 0.9, radius = 8,
+        popup = paste0("<b>AQS Site</b><br>", site$name_long, "<br>ID: ", site$aqs_id)
+      )
+
+    nearby <- tryCatch(nearby_met_stations(), error = function(e) NULL)
+    if (!is.null(nearby) && nrow(nearby) > 0) {
+      nb <- head(nearby, 15)  # keep the map readable
+      is_hourly <- input$data_type == "hourly"
+      nb_label <- if (is_hourly) nb$station else nb$station_name
+      nb_id    <- if (is_hourly) nb$code else nb$station_id
+      m <- m %>% leaflet::addCircleMarkers(
+        lng = nb$lon, lat = nb$lat,
+        color = "blue", fillColor = "blue", fillOpacity = 0.6, radius = 5,
+        popup = paste0("<b>MET Station</b><br>", nb_label,
+                       "<br>ID: ", nb_id,
+                       "<br>", sprintf("%.1f km", nb$distance_km))
+      ) %>%
+        leaflet::fitBounds(
+          lng1 = min(c(site$lon, nb$lon)), lat1 = min(c(site$lat, nb$lat)),
+          lng2 = max(c(site$lon, nb$lon)), lat2 = max(c(site$lat, nb$lat))
+        )
+    } else {
+      m <- m %>% leaflet::setView(lng = site$lon, lat = site$lat, zoom = 9)
+    }
+    m
+  })
+
   # Add observer for clear log button
   observeEvent(input$clear_log, {
     rv$status_log <- c("Log cleared.")
@@ -1895,10 +2098,8 @@ server <- function(input, output, session) {
     req(length(selected_plots) > 0) # Need at least one plot selected
     
     current_mode <- rv$current_datatype
-    
-    # Define hourly-only plots (values from plot_choices)
-    hourly_only_plot_values <- c("windrose", "polrose", "polar", "polarannulus", "percentilerose", "polarcluster", "stability")
-    
+
+    # hourly_only_plot_values is defined once at global scope.
     # Filter selected plots based on data type BEFORE generating UI
     if (current_mode == "daily") {
       selected_plots <- selected_plots[!selected_plots %in% hourly_only_plot_values]
@@ -1945,23 +2146,6 @@ server <- function(input, output, session) {
             plotOutput("dyn_calendar_plot_1", height = "600px"),
             tags$hr(),
             plotOutput("dyn_calendar_plot_2", height = "600px")
-          )
-        )
-      ))
-    }
-    
-    # Trend Plots Card (Conditional CPF for hourly)
-    if ("trend" %in% selected_plots) { # Note: 'trend' value covers both plots
-      plot_card_list <- c(plot_card_list, list(
-        bslib::card(
-          bslib::card_header("Trend Plots"),
-          bslib::card_body(
-            plotOutput("dyn_trend_plot_1"), # Smooth Trend (always shown if 'trend' selected)
-            if(current_mode == "hourly") {
-              plotOutput("dyn_trend_plot_2") # CPF Rose
-            } else {
-              tags$em("CPF Rose plot requires Hourly data.") # Placeholder if daily
-            }
           )
         )
       ))
@@ -2021,18 +2205,21 @@ server <- function(input, output, session) {
       ))
     }
     
-    # ggplot Trend Card
-    if ("ggtrend" %in% selected_plots) {
+    # Wind Rose Card (Hourly Only) - standard + diurnal
+    if ("windrose" %in% selected_plots && current_mode == "hourly") {
       plot_card_list <- c(plot_card_list, list(
         bslib::card(
-          bslib::card_header("ggplot Trend Plot"),
+          full_screen = TRUE,
+          bslib::card_header("Wind Rose"),
           bslib::card_body(
-            plotOutput("dyn_ggtrend_plot", height = "800px")
+            plotOutput("dyn_windrose_plot", height = "600px"),
+            tags$hr(),
+            plotOutput("dyn_windrose_diurnal", height = "700px")
           )
         )
       ))
     }
-    
+
     # Polar Plots Card (Conditional plots for hourly)
     if ("polar" %in% selected_plots) {
       plot_card_list <- c(plot_card_list, list(
@@ -2088,20 +2275,6 @@ server <- function(input, output, session) {
       ))
     }
     
-    # Scatter Plots (Other) Card
-    if ("scatter_other" %in% selected_plots) {
-      plot_card_list <- c(plot_card_list, list(
-        bslib::card(
-          bslib::card_header("Scatter Plots (Other Types)"),
-          bslib::card_body(
-            plotOutput("dyn_scatter_plot_2"),
-            plotOutput("dyn_scatter_plot_3"),
-            plotOutput("dyn_scatter_plot_4")
-          )
-        )
-      ))
-    }
-    
     # Correlation Plot Card
     if ("corr" %in% selected_plots) {
       plot_card_list <- c(plot_card_list, list(
@@ -2110,6 +2283,19 @@ server <- function(input, output, session) {
           bslib::card_body(
             # MODIFICATION: Added height of 600px
             plotOutput("dyn_corr_plot", height = "800px")
+          )
+        )
+      ))
+    }
+
+    # AQI Proportions (TimeProp) Card
+    if ("timeprop" %in% selected_plots) {
+      plot_card_list <- c(plot_card_list, list(
+        bslib::card(
+          full_screen = TRUE,
+          bslib::card_header("AQI Category Proportions (TimeProp)"),
+          bslib::card_body(
+            plotOutput("dyn_timeprop_plot", height = "700px")
           )
         )
       ))
@@ -2155,20 +2341,6 @@ server <- function(input, output, session) {
       }
     }
     
-    # Additional Plots Card (Conditional Diurnal WR for hourly)
-    if ("additional" %in% selected_plots) {
-      plot_card_list <- c(plot_card_list, list(
-        bslib::card(
-          bslib::card_header("Additional Plots"),
-          bslib::card_body(
-            plotOutput("dyn_additional_plot_1"),
-            plotOutput("dyn_additional_plot_2"),
-            if(current_mode == "hourly") plotOutput("dyn_additional_plot_3") else tags$em("Diurnal Wind Rose requires Hourly data.")
-          )
-        )
-      ))
-    }
-    
     # Polar Cluster Card
     if ("polarcluster" %in% selected_plots) {
       plot_card_list <- c(plot_card_list, list(
@@ -2181,18 +2353,21 @@ server <- function(input, output, session) {
       ))
     }
     
-    # Percentile Rose (Multiple) Card
-    if ("percentilerose_multi" %in% selected_plots) {
+    # Percentile Rose Card (Hourly Only) - overall + seasonal
+    if ("percentilerose" %in% selected_plots && current_mode == "hourly") {
       plot_card_list <- c(plot_card_list, list(
         bslib::card(
-          bslib::card_header("Multiple Percentile Roses"),
+          full_screen = TRUE,
+          bslib::card_header("Percentile Roses"),
           bslib::card_body(
+            plotOutput("dyn_percentilerose_plot", height = "600px"),
+            tags$hr(),
             plotOutput("dyn_percentilerose_multi", height = "800px")
           )
         )
       ))
     }
-    
+
     # Kernel Exceedance Card
     if ("kernelexceed" %in% selected_plots) {
       plot_card_list <- c(plot_card_list, list(
@@ -2200,18 +2375,6 @@ server <- function(input, output, session) {
           bslib::card_header("Kernel Density Exceedance Plot"),
           bslib::card_body(
             plotOutput("dyn_kernelexceed_plot", height = "800px")
-          )
-        )
-      ))
-    }
-    
-    # Conditional Bivariate Polar Plot Card
-    if ("polarconditional" %in% selected_plots) {
-      plot_card_list <- c(plot_card_list, list(
-        bslib::card(
-          bslib::card_header("Conditional Polar Plot by Temperature"),
-          bslib::card_body(
-            plotOutput("dyn_polarplot_conditional", height = "800px")
           )
         )
       ))
@@ -2356,17 +2519,6 @@ server <- function(input, output, session) {
   }), "Cal2 (Wind Vectors)")
   
   
-  # --- Trend Plots ---
-  output$dyn_trend_plot_1 <- render_plot_safely(quote({
-    shiny::validate(need(poll %in% names(df), "Missing pollutant"))
-    smoothTrend(df, pollutant=poll, statistic="percentile", percentile=c(5,50,95), main=paste("Trend", poll, "%iles -", sinfo$name_long, "(", rv$current_datatype, ")"))
-  }), "Trend1")
-  output$dyn_trend_plot_2 <- render_plot_safely(quote({
-    shiny::validate(need(rv$current_datatype == "hourly", "CPF Rose requires hourly data."))
-    shiny::validate(need(all(c(poll, "ws", "wd") %in% names(df)), "Missing pollutant, ws, or wd"))
-    percentileRose(df, pollutant=poll, percentile=95, method="cpf", main=paste("CPF Rose (95%", poll,") -", sinfo$name_long), min.bin=5)
-  }), "Trend2 (CPF Rose - Hourly Only)")
-  
   # --- TheilSen Plot ---
   output$dyn_theilsen_plot <- render_plot_safely(quote({
     shiny::validate(need(poll %in% names(df),"Missing pollutant"))
@@ -2484,21 +2636,8 @@ server <- function(input, output, session) {
     
   }), "TimeSeries")
   
-  # --- ggplot Trend Plot ---
-  output$dyn_ggtrend_plot <- render_plot_safely(quote({
-    breaks<-rv$current_breaks; labels<-rv$current_labels; colors<-rv$current_colors; req(breaks, labels, colors);
-    shiny::validate(need(all(c(poll,"date") %in% names(df)),"Missing poll/date")); shiny::validate(need(nrow(df)>0, "No data for ggplot"))
-    units_lab <- unique(df$units_of_measure)[1]; title_prefix <- if (rv$current_datatype == "hourly") "Hourly" else "Daily"
-    k_smooth <- if (rv$current_datatype == "daily") { non_na_count <- sum(!is.na(df[[poll]])); max_k <- max(3, non_na_count - 1); min(10, max_k) } else { NULL }
-    p<-ggplot(df, aes(x=date, y=.data[[poll]])) + geom_point(aes(color=cut(.data[[poll]], breaks=breaks, labels=labels, include.lowest=TRUE, right=FALSE)), size=1.5, alpha=0.7) +
-      scale_colour_manual(name="AQI Cat.", values=colors, na.value="grey50", drop=FALSE) +
-      { if (rv$current_datatype == "hourly") { geom_smooth(method="loess", span=0.1, se=FALSE, color="black", na.rm = TRUE) } else if (!is.null(k_smooth) && k_smooth >= 3) { geom_smooth(method = "gam", formula = y ~ s(as.numeric(x), k= k_smooth), se = FALSE, color = "black", na.rm=TRUE) } else { NULL } } +
-      labs(title=paste(sinfo$name_long, title_prefix, poll, "Trend", year(input$start_date_input),"-",year(input$end_date_input)), y=paste(poll, if(!is.na(units_lab)) paste0("(",units_lab,")") else ""), x="Date") + theme_minimal() + theme(axis.text.x=element_text(angle=45, hjust=1), legend.position="bottom")
-    print(p)
-  }), "ggTrend")
-  
   # --- Polar Plots ---
-  output$dyn_polar_plot_1 <- render_plot_safely(quote({ shiny::validate(need(all(c(poll,"ws","wd") %in% names(df)),"Missing poll/ws/wd")); polarPlot(df, pollutant=poll, statistic="mean", col="viridis", key.pos="bottom", key.header=paste("Mean",poll), main=paste("Mean",poll,"Conc. by Wind -", sinfo$name_long, "(", rv$current_datatype, ")")) }), "Polar1 (Mean)")
+  output$dyn_polar_plot_1 <- render_plot_safely(quote({ shiny::validate(need(all(c(poll,"ws","wd") %in% names(df)),"Missing poll/ws/wd")); polarPlot(df, pollutant=poll, statistic="mean", cols="viridis", key.pos="bottom", key.header=paste("Mean",poll), main=paste("Mean",poll,"Conc. by Wind -", sinfo$name_long, "(", rv$current_datatype, ")")) }), "Polar1 (Mean)")
   output$dyn_polar_plot_2 <- render_plot_safely(quote({ shiny::validate(need(rv$current_datatype == "hourly", "CPF Polar plot requires hourly data.")); shiny::validate(need(all(c(poll,"ws","wd") %in% names(df)),"Missing poll/ws/wd")); polarPlot(df, pollutant=poll, statistic="cpf", percentile=90, main=paste("CPF",poll,">= 90th %ile -", sinfo$name_long), min.bin=5) }), "Polar2 (CPF - Hourly Only)")
   output$dyn_polar_plot_3 <- render_plot_safely(quote({ shiny::validate(need(rv$current_datatype == "hourly", "Day/Night Polar plot requires hourly data.")); shiny::validate(need(all(c(poll,"ws","wd") %in% names(df)),"Missing poll/ws/wd")); polarPlot(df, pollutant=poll, statistic="mean", type="daylight", cols="viridis", key.header=paste("Mean",poll), main=paste("Day vs Night Mean",poll,"-", sinfo$name_long)) }), "Polar3 (Day/Night - Hourly Only)")
   output$dyn_polar_plot_4 <- render_plot_safely(quote({ shiny::validate(need(all(c("ws","wd") %in% names(df)),"Missing ws/wd")); polarFreq(df, statistic = "frequency", main=paste("Wind Freq. by Year -", sinfo$name_long, "(", rv$current_datatype, ")"), min.bin=1) }), "Polar4 (Wind Freq)")
@@ -2556,43 +2695,7 @@ server <- function(input, output, session) {
       plot.new(); title("Scatter1 Failed\n(No Met Vars Found)")
     }
   }), "Scatter1 (Met Grid)")
-  output$dyn_scatter_plot_2 <- render_plot_safely(quote({ shiny::validate(need(all(c(poll,"wd") %in% names(df)),"Missing poll/wd")); scatterPlot(df, x="wd", y=poll, method="hexbin", col="viridis", main=paste("Hexbin",poll,"vs WD -", sinfo$name_long, "(", rv$current_datatype, ")")) }), "Scatter2 (Hexbin)")
-  output$dyn_scatter_plot_3 <- render_plot_safely(quote({ shiny::validate(need(all(c(poll,"temp","rh") %in% names(df)),"Missing poll/temp/rh")); scatterPlot(df, x="temp", y=poll, z="rh", col="viridis", key.title="RH (%)", main=paste("Scatter",poll,"vs Temp (col=RH) -", sinfo$name_long, "(", rv$current_datatype, ")")) }), "Scatter3 (Color=RH)")
-  # Replace the existing output$dyn_scatter_plot_4 block (around line 1834-1852)
-  output$dyn_scatter_plot_4 <- render_plot_safely(quote({
-    shiny::validate(need(all(c(poll,"temp") %in% names(df)),"Missing poll/temp"))
-    
-    # Robustly clean data: ensure numeric type and remove non-finite values
-    df_quant <- df %>%
-      select(date, temp, all_of(poll)) %>%
-      mutate(
-        temp = as.numeric(temp),
-        !!poll := as.numeric(.data[[poll]])
-      ) %>%
-      filter(is.finite(temp) & is.finite(.data[[poll]]))
-    
-    shiny::validate(need(nrow(df_quant) > 10,"Scatter (Quantile) failed: < 10 complete data points for analysis."))
-    
-    # Try-catch the scatterPlot call as it may have internal issues with certain data
-    tryCatch({
-      scatterPlot(df_quant, x="temp", y=poll, method="quantile", 
-                  main=paste("Quantiles",poll,"vs Temp -", sinfo$name_long, "(", rv$current_datatype, ")"),
-                  auto.text=FALSE)
-    }, error = function(e) {
-      # Fallback to a basic quantile regression plot using ggplot2
-      library(quantreg)
-      p <- ggplot(df_quant, aes(x=temp, y=.data[[poll]])) +
-        geom_point(alpha=0.3, size=1, color="gray50") +
-        geom_quantile(quantiles = c(0.1, 0.25, 0.5, 0.75, 0.9), 
-                      color="blue", linewidth=0.8, alpha=0.7) +
-        theme_minimal() +
-        labs(title=paste("Quantiles",poll,"vs Temp -", sinfo$name_long, "(", rv$current_datatype, ")"),
-             x="Temperature", y=poll)
-      print(p)
-    })
-  }), "Scatter4 (Quantile)")
-  
-  # --- Correlation Plot ---
+
   # --- Correlation Plot ---
   output$dyn_corr_plot <- render_plot_safely(quote({
     # Define a base list of met columns
@@ -2667,10 +2770,11 @@ server <- function(input, output, session) {
     shiny::validate(need(!is.null(base_breaks) && !is.null(base_colors),
                   paste("AQI breaks/colors not defined for:", local_poll_colname, "and type:", rv$current_datatype)))
     
-    # Generate the gradient palette
+    # Generate the gradient palette.
+    # NOTE: the function's formal args are aqi_breaks / aqi_colors (not base_*).
     gradient_info <- generate_aqi_intra_gradient_palette_revised(
-      base_breaks = base_breaks,
-      base_colors = base_colors,
+      aqi_breaks = base_breaks,
+      aqi_colors = base_colors,
       n_steps = 100
     )
     
@@ -2792,80 +2896,10 @@ server <- function(input, output, session) {
   output$dyn_timevar_plot_1 <- render_plot_safely(quote({ shiny::validate(need(rv$current_datatype == "hourly", "Time Variation plots require hourly data.")); shiny::validate(need(poll %in% names(df),"Missing poll")); timeVariation(df, pollutant=poll, statistic="mean", conf.int=0.95, main=paste("Diurnal, Weekly, Monthly Var.",poll,"-", sinfo$name_long)) }), "TimeVar1 (Hourly Only)")
   output$dyn_timevar_plot_2 <- render_plot_safely(quote({ shiny::validate(need(rv$current_datatype == "hourly", "Time Variation plots require hourly data.")); met_var <- if ("temp" %in% names(df)) "temp" else if ("ws" %in% names(df)) "ws" else NULL; shiny::validate(need(poll %in% names(df), "Missing Pollutant")); shiny::validate(need(!is.null(met_var), "Temp or WS missing for comparison")); timeVariation(df, pollutant=c(poll, met_var), normalise=TRUE, main=paste("Norm. Var:",poll,"vs", met_var,"-", sinfo$name_long)) }), "TimeVar2 (Norm - Hourly Only)")
   
-  # --- High Ozone Diagnostics Plots ---
-  output$dyn_windrose_high_plot <- render_plot_safely(quote({
-    shiny::validate(need(rv$current_datatype == "hourly", "High Conc Wind Rose requires hourly data."))
-    shiny::validate(need(all(c(poll, "ws", "wd") %in% names(df)), "Missing pollutant, ws, or wd"))
-    # Filter for USG or above
-    high_threshold <- if (grepl("OZONE", poll) && !grepl("PPB", poll)) 0.070 else if (grepl("OZONE.*8HR.*PPB", poll)) 70 else if (grepl("PM2", poll)) 35.4 else quantile(df[[poll]], 0.90, na.rm=TRUE)
-    df_sub <- df[df[[poll]] >= high_threshold, ]
-    shiny::validate(need(nrow(df_sub) > 5, paste("Not enough data points above threshold (", high_threshold, ") for wind rose.")))
-    windRose(df_sub, main=paste("Wind Rose (Concentration >=", round(high_threshold, 3), ") -", sinfo$name_long))
-  }), "High Con Wind Rose")
-  
-  output$dyn_timevar_high_plot <- render_plot_safely(quote({
-    shiny::validate(need(rv$current_datatype == "hourly", "Time Var requires hourly data."))
-    shiny::validate(need(poll %in% names(df), "Missing pollutant"))
-    high_threshold <- quantile(df[[poll]], 0.90, na.rm=TRUE)
-    df_sub <- df[df[[poll]] >= high_threshold, ]
-    shiny::validate(need(nrow(df_sub) > 20, "Not enough data points > 90th percentile."))
-    timeVariation(df_sub, pollutant=poll, main=paste("Time Variation (> 90th Percentile) -", sinfo$name_long))
-  }), "High Conc TimeVar")
+  # --- Wind Rose Plots (standard + diurnal) ---
+  output$dyn_windrose_plot <- render_plot_safely(quote({ shiny::validate(need(all(c("ws","wd") %in% names(df)),"Missing ws/wd")); windRose(df, main=paste("Wind Rose -", sinfo$name_long, "(", rv$current_datatype, ")")) }), "WindRose")
+  output$dyn_windrose_diurnal <- render_plot_safely(quote({ shiny::validate(need(rv$current_datatype == "hourly", "Diurnal Wind Rose requires hourly data.")); shiny::validate(need(all(c("ws","wd") %in% names(df)),"Missing ws/wd")); windRose(df, type="hour", main=paste("Diurnal Wind Rose -", sinfo$name_long)) }), "Diurnal WindRose (Hourly Only)")
 
-  output$dyn_scatter_season_plot <- render_plot_safely(quote({
-    shiny::validate(need(all(c(poll, "temp") %in% names(df)), "Missing pollutant or temp"))
-    scatterPlot(df, x="temp", y=poll, type="season", method="hexbin", col="viridis", main=paste("Pol vs Temp by Season -", sinfo$name_long))
-  }), "Seasonal Scatter")
-
-  # --- Additional Plots ---
-  # Replace the existing output$dyn_additional_plot_1 block (around line 1906-1923)
-  output$dyn_additional_plot_1 <- render_plot_safely(quote({
-    shiny::validate(need(all(c(poll,"temp","date") %in% names(df)),"Missing poll/temp/date"))
-    
-    # Robustly clean data for linear model, removing any non-finite values
-    data_lr <- df %>%
-      select(date, temp, all_of(poll)) %>%
-      mutate(
-        temp = as.numeric(temp),
-        !!poll := as.numeric(.data[[poll]])
-      ) %>%
-      filter(is.finite(temp) & is.finite(.data[[poll]]))
-    
-    shiny::validate(need(nrow(data_lr) > 10, "LinRel failed: < 10 complete data points for analysis."))
-    
-    # Add season column if missing (linearRelation needs it when condition="season")
-    if(!"season" %in% names(data_lr)) {
-      data_lr <- data_lr %>%
-        mutate(season = case_when(
-          month(date) %in% c(12, 1, 2) ~ "winter",
-          month(date) %in% c(3, 4, 5) ~ "spring",
-          month(date) %in% c(6, 7, 8) ~ "summer",
-          month(date) %in% c(9, 10, 11) ~ "autumn",
-          TRUE ~ "unknown"
-        ))
-    }
-    
-    # Try the linearRelation plot with error handling
-    tryCatch({
-      linearRelation(data_lr, x="temp", y=poll, condition="season",
-                     main=paste("Linear Rel",poll,"~Temp by Season -", sinfo$name_long, "(", rv$current_datatype, ")"))
-    }, error = function(e) {
-      # Fallback to a ggplot2 version if linearRelation fails
-      p <- ggplot(data_lr, aes(x=temp, y=.data[[poll]], color=season)) +
-        geom_point(alpha=0.3, size=1) +
-        geom_smooth(method="lm", se=TRUE) +
-        facet_wrap(~season, scales="free") +
-        theme_minimal() +
-        labs(title=paste("Linear Rel",poll,"~Temp by Season -", sinfo$name_long, "(", rv$current_datatype, ")"),
-             x="Temperature", y=poll) +
-        theme(legend.position="bottom")
-      print(p)
-    })
-  }), "Add1 (LinRel)")
-  
-  output$dyn_additional_plot_2 <- render_plot_safely(quote({ shiny::validate(need(all(c("ws","wd") %in% names(df)),"Missing ws/wd")); windRose(df, main=paste("Wind Rose -", sinfo$name_long, "(", rv$current_datatype, ")")) }), "Add2 (WindRose)")
-  output$dyn_additional_plot_3 <- render_plot_safely(quote({ shiny::validate(need(rv$current_datatype == "hourly", "Diurnal Wind Rose requires hourly data.")); shiny::validate(need(all(c("ws","wd") %in% names(df)),"Missing ws/wd")); windRose(df, type="hour", main=paste("Diurnal Wind Rose -", sinfo$name_long)) }), "Add3 (Diurnal WR - Hourly Only)")
-  
   # --- Polar Cluster Plot ---
   output$dyn_polarcluster_plot <- render_plot_safely(quote({
     shiny::validate(need(all(c(poll, "ws", "wd") %in% names(df)), "Missing pollutant, ws, or wd"))
@@ -2928,25 +2962,7 @@ server <- function(input, output, session) {
             col.main = "red", cex.sub = 0.8)
     }
   }), "KernelExceed")
-  
-  # --- Conditional Bivariate Polar Plot ---
-  output$dyn_polarplot_conditional <- render_plot_safely(quote({
-    shiny::validate(need(all(c(poll, "ws", "wd", "temp") %in% names(df)), "Missing required variables"))
-    
-    # Create temperature categories
-    df_temp <- df %>%
-      mutate(temp_cat = cut(temp, 
-                            breaks = quantile(temp, probs = c(0, 0.25, 0.5, 0.75, 1), na.rm = TRUE),
-                            labels = c("Cold", "Cool", "Moderate", "Warm"),
-                            include.lowest = TRUE))
-    
-    polarPlot(df_temp,
-              pollutant = poll,
-              type = "temp_cat",
-              statistic = "mean",
-              main = paste("Mean", poll, "by Temperature Category -", sinfo$name_long))
-  }), "PolarConditional")
-  
+
   # ADD THESE NEW DOWNLOAD HANDLERS:
   output$download_merged_data <- downloadHandler(
     filename = function() {
@@ -2974,10 +2990,18 @@ server <- function(input, output, session) {
     },
     content = function(file) {
       req(rv$plot_dir)
-      plot_files <- list.files(rv$plot_dir, full.names = TRUE, 
+      # Prefer files in the currently-selected format; if the user switched the
+      # format after running (so none match), fall back to any saved image.
+      plot_files <- list.files(rv$plot_dir, full.names = TRUE,
                                pattern = paste0("\\.", input$download_format, "$"))
-      if(length(plot_files) > 0) {
+      if (length(plot_files) == 0) {
+        plot_files <- list.files(rv$plot_dir, full.names = TRUE,
+                                 pattern = "\\.(png|pdf|svg)$")
+      }
+      if (length(plot_files) > 0) {
         zip(file, plot_files, flags = "-j")
+      } else {
+        showNotification("No saved plot files found to download. Run an analysis first.", type = "warning")
       }
     }
   )

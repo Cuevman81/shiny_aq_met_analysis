@@ -1,4 +1,18 @@
+# --- RStudio / R session artifacts ---
 .Rproj.user
 .Rhistory
 .RData
 .Ruserdata
+
+# --- App runtime artifacts (regenerated on each run; should not be committed) ---
+app_cache/
+app_data/
+
+# Timestamped analysis output folders created per run
+# (e.g. Hernando_hourly_Analysis_20260331_212531/)
+*_Analysis_*/
+
+# Downloaded IEM/NOAA CSVs and cached metadata that may land at the project root
+IEM_Hourly_*.csv
+IEM_Daily_*.csv
+aqs_sites.zip

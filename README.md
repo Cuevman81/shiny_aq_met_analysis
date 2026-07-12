@@ -6,12 +6,14 @@ An R Shiny application for site-specific analysis of air quality and meteorologi
 
 ## Key Features
 
--   **Categorized Visualization Suite**: Newly organized sidebar with grouped plot selections:
-    -   **Temporal Trends (Both)**: Calendar Plots, Time Series, Interactive TrendLevel, and Diurnal/Weekly Time Variation.
-    -   **Meteorological & Source (Hourly Only)**: Bivariate Polar Plots, Polar Annulus (Diurnal/Wind), Percentile Roses, Pollution Roses, and Stability Analysis.
-    -   **Statistical & Diagnostic (Both)**: Data Summary Heatmaps, AQI Category Proportions (TimeProp), Scatter Plots (Pollutant vs Met), and Correlation Matrices.
+-   **Categorized Visualization Suite**: Organized sidebar with grouped plot selections (each group has a **Select all / Clear** shortcut):
+    -   **Temporal Trends (Both)**: Calendar Plots, Time Series, Interactive TrendLevel, Diurnal/Weekly Time Variation, Theil-Sen Trend, and Wind-Normalized Trend.
+    -   **Meteorological & Source (Hourly Only)**: Wind Roses (standard + diurnal), Pollution Roses, Bivariate Polar Plots, Polar Annulus, Percentile Roses, Polar Cluster Analysis, and Stability Analysis.
+    -   **Statistical & Diagnostic (Both)**: Data Summary Heatmaps, AQI Category Proportions (TimeProp), Scatter Plots (Pollutant vs Met), Correlation Matrices, and Kernel Density Exceedance.
+-   **Interactive Site Map**: A Leaflet map showing the selected AQS site and nearby MET stations with their distances, to sanity-check the site-to-station pairing.
+-   **Data Provenance**: The Statistics tab reports which MET source actually supplied the data (real-time IEM ASOS vs. quality-controlled NOAA ISH) and the station distance.
 -   **Statistical Summaries**: Detailed metrics for both pollutants and weather, including AQI categories and diurnal patterns.
--   **Data Export**: Allows you to download the final merged dataset as a CSV and all generated plots as a ZIP archive.
+-   **Data Export**: Download the final merged dataset as a CSV and **all** generated plots as a ZIP archive in your chosen format (PNG, PDF, or SVG).
 
 ## How to Run the App
 
@@ -22,7 +24,13 @@ An R Shiny application for site-specific analysis of air quality and meteorologi
     ```
 2.  **Install Dependencies**: Open R and run:
     ```r
-    install.packages(c("shiny", "bslib", "dplyr", "lubridate", "openair", "readr", "httr", "purrr", "future", "furrr"))
+    install.packages(c(
+      "shiny", "bslib", "bsicons", "leaflet", "Hmisc", "dplyr", "digest",
+      "lubridate", "worldmet", "openair", "readr", "ggplot2", "gridExtra",
+      "viridis", "padr", "httr", "purrr", "future", "furrr", "DT",
+      "shinycssloaders", "shinyjs", "zip", "glue", "tidyr", "mgcv",
+      "RColorBrewer", "geosphere", "quantreg"
+    ))
     ```
 3.  **Run the App**: Open `Met_Pollutant_Analysis_Airnow_APP.R` and click **Run App**.
 
