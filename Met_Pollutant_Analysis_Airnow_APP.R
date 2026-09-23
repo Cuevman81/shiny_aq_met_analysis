@@ -48,12 +48,19 @@ AIRNOW_HOURLY_BASE_URL <- "https://s3-us-west-1.amazonaws.com/files.airnowtech.o
 AIRNOW_DAILY_BASE_URL <- "https://s3-us-west-1.amazonaws.com/files.airnowtech.org/airnow" # Same base, different path structure
 IEM_DAILY_MET_URL_TEMPLATE <- "https://mesonet.agron.iastate.edu/cgi-bin/request/daily.py?network={network}&stations={station_id}&year1={sy}&month1={sm}&day1={sd}&year2={ey}&month2={em}&day2={ed}&vars%5B%5D=max_tmpf&vars%5B%5D=min_tmpf&vars%5B%5D=max_dwpf&vars%5B%5D=min_dwpf&vars%5B%5D=pday&vars%5B%5D=avg_sknt&vars%5B%5D=avg_drct&vars%5B%5D=min_rh&vars%5B%5D=avg_rh&vars%5B%5D=max_rh&vars%5B%5D=snow&vars%5B%5D=snowd&vars%5B%5D=min_feel&vars%5B%5D=avg_feel&vars%5B%5D=max_feel&vars%5B%5D=max_sped&vars%5B%5D=max_gust&vars%5B%5D=srad_mj&format=csv"
 
+# --- AQI CATEGORY BREAKS ---
+# Each break is the UPPER edge of a category (EPA-454/B-24-002, May 2024, Table 6),
+# so a value exactly on an edge (54 or 70 ppb, 9.0 or 35.4 ug/m3) belongs to the
+# LOWER category. Always categorise with aqi_category() below (cut with right = TRUE).
+
 # --- HOURLY BREAKS ---
+# These apply the 8-h ozone / 24-h PM2.5 edges to 1-hour values. That is a visual
+# guide only: EPA's AQI has no 1-hour ozone category below 0.125 ppm.
 O3_HOURLY_BREAKS_PPM <- c(0, 0.054001, 0.070001, 0.085001, 0.105001, Inf)
 O3_HOURLY_LABELS <- c("Good", "Moderate", "USG", "Unhealthy", "Very Unhealthy")
 O3_HOURLY_COLS <- c("green", "yellow", "orange", "red", "purple")
 
-PM25_HOURLY_BREAKS_UGM3 <- c(0, 9.0, 35.4, 55.4, 150.4, 250.4, Inf) # Current EPA NowCast breaks approx
+PM25_HOURLY_BREAKS_UGM3 <- c(0, 9.0, 35.4, 55.4, 125.4, 225.4, Inf) # 2024 PM2.5 edges (EPA-454/B-24-002 Table 6)
 PM25_HOURLY_LABELS <- c("Good", "Moderate", "USG", "Unhealthy", "Very Unhealthy", "Hazardous")
 PM25_HOURLY_COLS <- c("green", "yellow", "orange", "red", "purple", "maroon")
 
@@ -63,10 +70,16 @@ O3_DAILY_8HR_BREAKS_PPB <- c(0, 54, 70, 85, 105, 200, Inf) # PPB values correspo
 O3_DAILY_8HR_LABELS <- c("Good", "Moderate", "USG", "Unhealthy", "Very Unhealthy", "Hazardous")
 O3_DAILY_8HR_COLS <- c("green", "yellow", "orange", "red", "purple", "maroon")
 
-# PM2.5 Daily AQI breaks (24hr avg)
-PM25_DAILY_24HR_BREAKS_UGM3 <- c(0, 9.0, 35.4, 55.4, 150.4, 250.4, Inf) # UGM3 values for AQI 50, 100, 150, 200, 300
+# PM2.5 Daily AQI breaks (24hr avg): 2024 edges (EPA-454/B-24-002 Table 6)
+PM25_DAILY_24HR_BREAKS_UGM3 <- c(0, 9.0, 35.4, 55.4, 125.4, 225.4, Inf) # UGM3 values for AQI 50, 100, 150, 200, 300
 PM25_DAILY_24HR_LABELS <- c("Good", "Moderate", "USG", "Unhealthy", "Very Unhealthy", "Hazardous")
 PM25_DAILY_24HR_COLS <- c("green", "yellow", "orange", "red", "purple", "maroon")
+
+# AQI category for each value. Breaks are upper edges, so cut with right = TRUE
+# (the same rule openair's calendar and rose colours use). Values below 0 count as Good.
+aqi_category <- function(x, breaks, labels) {
+  cut(x, breaks = c(-Inf, breaks[-1]), labels = labels, right = TRUE)
+}
 
 # NOAA retired the ISD global-hourly archive that worldmet::importNOAA() reads:
 # its last records are 2025-08-27 ~06 UTC (NCEI access/2026/ returns 404). 2025-08-25
@@ -2009,12 +2022,16 @@ server <- function(input, output, session) {
       summarise(total = sum(Count, na.rm = TRUE)) %>%
       pull(total)
     
+    # In hourly mode these are 1-hour values measured against the 8-h ozone / 24-h
+    # PM2.5 edges: a guide, not an AQI or exceedance count (EPA gives 1-hour ozone no
+    # AQI category below 0.125 ppm).
+    is_hourly <- identical(rv$current_datatype, "hourly")
     bslib::value_box(
-      title = "Days/Hours >= USG",
+      title = if (is_hourly) "Hours above the 8-h/24-h USG level" else "Days >= USG",
       value = exceed_count,
       showcase = bsicons::bs_icon("exclamation-triangle"),
       theme = if(exceed_count > 0) "danger" else "success",
-      p("Based on AQI categories")
+      p(if (is_hourly) "1-hour values vs daily AQI edges: a guide, not an AQI count" else "Based on AQI categories (EPA 2024)")
     )
   })
   
@@ -3234,14 +3251,9 @@ server <- function(input, output, session) {
     if (!is.null(aqi_breaks) && !is.null(aqi_labels) && length(aqi_labels) == length(aqi_breaks) - 1) {
       valid_poll_values <- df_stats[[poll_col]][!is.na(df_stats[[poll_col]])]
       if(length(valid_poll_values) > 0) {
-        # Ensure breaks include -Inf if 0 is the first break
-        if (aqi_breaks[1] == 0) aqi_breaks_cut <- c(-Inf, aqi_breaks[-1]) else aqi_breaks_cut <- aqi_breaks
-        
-        aqi_cats <- cut(valid_poll_values, 
-                        breaks = aqi_breaks_cut, 
-                        labels = aqi_labels, 
-                        right = FALSE, # Intervals are [low, high)
-                        include.lowest = TRUE) # Include lowest value if it matches first break
+        # Breaks are category upper edges: (low, high], so 70 ppb is Moderate and
+        # 35.4 ug/m3 is Moderate (EPA-454/B-24-002 Table 6). Values below 0 count as Good.
+        aqi_cats <- aqi_category(valid_poll_values, aqi_breaks, aqi_labels)
         
         results$aqi_summary_table <- table(aqi_cats, dnn = "AQI_Category") %>%
           as.data.frame() %>%
@@ -3253,7 +3265,7 @@ server <- function(input, output, session) {
         for (i in 1:length(aqi_labels)) {
           low <- aqi_breaks[i]
           high <- aqi_breaks[i+1]
-          ranges[i] <- paste0("[", round(low, 1), ", ", if(is.infinite(high)) "Inf" else round(high, 1), ")")
+          ranges[i] <- paste0(if (i == 1) "[" else "(", round(low, 3), ", ", if(is.infinite(high)) "Inf)" else paste0(round(high, 3), "]"))
         }
         range_df <- data.frame(Category = factor(aqi_labels, levels=aqi_labels), Range = ranges)
         results$aqi_summary_table <- left_join(range_df, results$aqi_summary_table, by = "Category") %>%
