@@ -342,6 +342,16 @@ fetch_and_cache_pollutant_data <- function(site_info, selected_pollutant_code, s
   return(data_r)
 }
 
+# Speed-weighted vector mean of wind direction (degrees, 0-360). Directions must not
+# be averaged as plain numbers: the plain mean of 350 and 10 degrees is 180 (south).
+vector_mean_direction <- function(ws, wd) {
+  ok <- !is.na(ws) & !is.na(wd)
+  if (!any(ok)) return(NA_real_)
+  u <- mean(ws[ok] * sin(wd[ok] * pi / 180))
+  v <- mean(ws[ok] * cos(wd[ok] * pi / 180))
+  (atan2(u, v) * 180 / pi) %% 360
+}
+
 # --- REAL-TIME HOURLY IEM Met Helper ---
 # Equivalent to the Python script provided by the user.
 fetch_process_iem_hourly_met <- function(station_call_sign, station_state, start_date, end_date, met_dir) {
@@ -368,8 +378,11 @@ fetch_process_iem_hourly_met <- function(station_call_sign, station_state, start
   # Network construction (e.g. TN_ASOS)
   network <- paste0(toupper(trimws(station_state)), "_ASOS")
   
-  # Construction of the URL with network parameter included for robustness
-  url <- glue::glue("{SERVICE}network={network}&station={clean_id}&data=tmpf&data=relh&data=drct&data=sknt&data=p01i&data=gust&year1={sy}&month1={sm}&day1={sd}&year2={ey}&month2={em}&day2={ed}&tz=Etc/UTC&format=onlycomma&missing=M&trace=T&direct=no&report_type=3&report_type=4")
+  # Construction of the URL with network parameter included for robustness.
+  # Routine reports only (report_type=3), one per hour like the ISD record: a special
+  # (report_type=4) repeats the p01i rain the routine report already counts, since
+  # p01i is the accumulation since the last hourly reset.
+  url <- glue::glue("{SERVICE}network={network}&station={clean_id}&data=tmpf&data=relh&data=drct&data=sknt&data=p01i&data=gust&year1={sy}&month1={sm}&day1={sd}&year2={ey}&month2={em}&day2={ed}&tz=Etc/UTC&format=onlycomma&missing=M&trace=T&direct=no&report_type=3")
   
   local_met_file <- file.path(met_dir, paste0("IEM_Hourly_", clean_id, "_", sy, sm, sd, "_", ey, em, ed, ".csv"))
   
@@ -407,14 +420,18 @@ fetch_process_iem_hourly_met <- function(station_call_sign, station_state, start
             precip = suppressWarnings(if_else(p01i == "T", 0.0001, as.numeric(p01i))),
             gust = suppressWarnings(as.numeric(gust)) * 0.514444 # kts to m/s
           ) %>%
-          # Group by rounded date in case there are multiple observations (Specials) in one hour
+          # Group by hour in case a station sends more than one routine report in an hour
           group_by(date) %>% 
           summarise(
             temp = mean(temp, na.rm = TRUE),
+            # Vector mean weighted by speed (as worldmet does for ISD); computed before
+            # ws is summarised. A plain mean of 360 and 10 degrees would give 185.
+            wd = vector_mean_direction(ws, wd),
             ws = mean(ws, na.rm = TRUE),
-            wd = mean(wd, na.rm = TRUE),
             rh = mean(rh, na.rm = TRUE),
-            precip = sum(precip, na.rm = TRUE),
+            # p01i is cumulative since the last hourly reset, so reports in one hour
+            # are not additive: take the largest, not the sum.
+            precip = if (all(is.na(precip))) NA_real_ else max(precip, na.rm = TRUE),
             gust = if(all(is.na(gust))) NA_real_ else max(gust, na.rm = TRUE),
             .groups = "drop"
           )
@@ -2527,11 +2544,12 @@ server <- function(input, output, session) {
           filter(lubridate::year(date) == target_year) %>%
           mutate(day_date = as.Date(date, tz = site_tz)) %>%
           group_by(day_date) %>%
-          # Create daily summaries: max pollutant, mean ws, and mean wd
+          # Create daily summaries: max pollutant, mean ws, and vector-mean wd
+          # (a plain mean of 350 and 10 degrees would point the arrow south)
           summarise(
             "{poll}" := if(all(is.na(.data[[poll]]))) NA_real_ else max(.data[[poll]], na.rm = TRUE),
+            wd = vector_mean_direction(ws, wd),
             ws = if(all(is.na(ws))) NA_real_ else mean(ws, na.rm = TRUE),
-            wd = if(all(is.na(wd))) NA_real_ else mean(wd, na.rm = TRUE),
             .groups = 'drop'
           ) %>%
           # Now filter out any remaining days with incomplete data
