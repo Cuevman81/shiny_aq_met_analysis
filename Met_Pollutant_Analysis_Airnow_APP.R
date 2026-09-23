@@ -81,6 +81,16 @@ aqi_category <- function(x, breaks, labels) {
   cut(x, breaks = c(-Inf, breaks[-1]), labels = labels, right = TRUE)
 }
 
+# Breaks for openair's calendarPlot() and trendLevel(). openair 3.x passes plain
+# numeric breaks through round_safely(), which keeps only the fewest decimals that
+# leave them distinct: 35.4 becomes 35 and 0.054001 becomes 0.05, so edge days get
+# the next category's colour (openair 3.1.0: 6 of 13 PM2.5 edge values mis-binned).
+# A breakOpts list with dig.lab = 6 keeps them exact. pollutionRose() bins
+# correctly with plain breaks and does not accept the list form.
+oa_breaks <- function(b) {
+  if (utils::packageVersion("openair") >= "3.0.0") list(breaks = b, dig.lab = 6) else b
+}
+
 # NOAA retired the ISD global-hourly archive that worldmet::importNOAA() reads:
 # its last records are 2025-08-27 ~06 UTC (NCEI access/2026/ returns 404). 2025-08-25
 # is the last local-standard-time day it covers in every US time zone, so any hourly
@@ -1929,7 +1939,7 @@ server <- function(input, output, session) {
       if ("summary" %in% all_selected)
         save_plot_auto("DataSummary", function() data_summary_plot(df_save, poll_save, data_type_mode, start_d, end_d, site_tz, paste("Data Summary", poll_save, "-", sname)))
       if ("calendar" %in% all_selected)
-        save_plot_auto("Calendar", function() calendarPlot(daily_max_df(df_save), pollutant = poll_save, cols = cols_aqi, breaks = brks, main = paste("Calendar", poll_save, "-", sname)))
+        save_plot_auto("Calendar", function() calendarPlot(daily_max_df(df_save), pollutant = poll_save, cols = cols_aqi, breaks = oa_breaks(brks), main = paste("Calendar", poll_save, "-", sname)))
       if ("timeseries" %in% all_selected)
         save_plot_auto("TimeSeries", function() timePlot(df_save, pollutant = poll_save, main = paste("Time Series", poll_save)))
       if ("timevar" %in% all_selected && data_type_mode == "hourly")
@@ -1937,7 +1947,7 @@ server <- function(input, output, session) {
       if ("theilsen" %in% all_selected && length(unique(year(df_save$date))) > 1)
         save_plot_auto("TheilSen", function() TheilSen(df_save, pollutant = poll_save, deseason = TRUE))
       if ("trendlevel" %in% all_selected && data_type_mode == "hourly")
-        save_plot_auto("TrendLevel", function() trendLevel(df_save, pollutant = poll_save, x = "month", y = "hour", cols = cols_aqi, breaks = brks))
+        save_plot_auto("TrendLevel", function() trendLevel(df_save, pollutant = poll_save, x = "month", y = "hour", cols = cols_aqi, breaks = oa_breaks(brks)))
       if ("timeprop" %in% all_selected) {
         save_plot_auto("AQI_Proportions", function() {
           df_p <- df_save %>% mutate(aqi_cat = droplevels(aqi_category(.data[[poll_save]], brks, labs))) %>% filter(!is.na(aqi_cat))
@@ -2575,7 +2585,7 @@ server <- function(input, output, session) {
     }
     
     shiny::validate(need(nrow(plot_data) > 0, "No data for calendar plot"))
-    calendarPlot(plot_data, pollutant = poll, year = years, main = plot_title, cols = colors, breaks = breaks, key.footer = paste(labels, collapse=" | "), key.position = "right")
+    calendarPlot(plot_data, pollutant = poll, year = years, main = plot_title, cols = colors, breaks = oa_breaks(breaks), key.footer = paste(labels, collapse=" | "), key.position = "right")
   }), "Cal1 (AQI Colors)")
   
   # Calendar Plot 2: Annotated with Wind Direction (Corrected for Hourly)
@@ -2618,7 +2628,7 @@ server <- function(input, output, session) {
     # Validation after filtering
     shiny::validate(need(nrow(plot_data) > 0, "No data with valid ws/wd found for wind calendar"))
     
-    calendarPlot(plot_data, pollutant = poll, year = years, main = plot_title, cols = colors, breaks = breaks,
+    calendarPlot(plot_data, pollutant = poll, year = years, main = plot_title, cols = colors, breaks = oa_breaks(breaks),
                  annotate = "wd", annotate.args = list(col = "black", lwd=0.8),
                  key.footer = "Wind Vectors", key.position = "right")
   }), "Cal2 (Wind Vectors)")
@@ -2956,7 +2966,7 @@ server <- function(input, output, session) {
                xlab = x_axis_label,
                # --- Use GRADIENT AQI settings ---
                cols = palette_info$fine_colors,
-               breaks = palette_info$fine_breaks,
+               breaks = oa_breaks(palette_info$fine_breaks),
                key.position = "right",
                key.header = palette_info$poll_label,
                key.footer = NULL
@@ -2993,7 +3003,7 @@ server <- function(input, output, session) {
                ylab = "Wind Direction",
                # --- Use GRADIENT AQI settings ---
                cols = palette_info$fine_colors,
-               breaks = palette_info$fine_breaks,
+               breaks = oa_breaks(palette_info$fine_breaks),
                key.position = "right",
                key.header = palette_info$poll_label,
                key.footer = NULL
