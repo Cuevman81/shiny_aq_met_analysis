@@ -1118,6 +1118,47 @@ select_all_none <- function(group_id) {
   )
 }
 
+# Data summary heatmap: % of possible hours (or days) in each month that have a
+# value, per variable. Replaces openair::summaryPlot(), which openair 3.0 removed.
+data_summary_plot <- function(df, poll, data_type, start_d, end_d, tz, title) {
+  vars <- intersect(c(poll, "ws", "wd", "temp", "rh"), names(df))
+  days <- seq(as.Date(start_d), as.Date(end_d), by = "day")
+  per_day <- if (data_type == "hourly") 24 else 1
+  possible <- tibble(month = format(days, "%Y-%m")) %>% count(month, name = "possible") %>%
+    mutate(possible = possible * per_day)
+  cap <- df %>%
+    mutate(month = format(date, "%Y-%m", tz = tz)) %>%
+    filter(month %in% possible$month) %>%
+    group_by(month) %>%
+    summarise(across(all_of(vars), ~ sum(!is.na(.x))), .groups = "drop") %>%
+    pivot_longer(-month, names_to = "variable", values_to = "n") %>%
+    tidyr::complete(month = possible$month, variable = vars, fill = list(n = 0)) %>%
+    left_join(possible, by = "month") %>%
+    mutate(pct = pmin(100, 100 * n / possible), variable = factor(variable, levels = rev(vars)))
+  ggplot(cap, aes(x = month, y = variable, fill = pct)) +
+    geom_tile(colour = "white") +
+    geom_text(aes(label = sprintf("%.0f", pct)), size = 3.5) +
+    scale_fill_gradientn(colours = c("#d73027", "#fee08b", "#1a9850"), limits = c(0, 100), name = "% captured") +
+    labs(title = title, x = "Month (LST)", y = NULL,
+         subtitle = paste("Share of possible", if (data_type == "hourly") "hours" else "days", "with a value in the merged data")) +
+    theme_minimal() + theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.grid = element_blank())
+}
+
+# Value above which a pollutant is in the USG category or worse (the top of Moderate).
+usg_threshold <- function(poll) {
+  switch(poll, "OZONE" = 0.070, "PM2.5" = 35.4, "OZONE_8HR_PPB" = 70, "PM25_24HR_UGM3" = 35.4, NULL)
+}
+
+# Kernel density of the pollutant with the USG threshold marked. Replaces
+# openair::kernelExceed(), which openair removed.
+kernel_density_plot <- function(x, threshold, poll, title) {
+  plot(stats::density(x, na.rm = TRUE), main = title, xlab = poll, ylab = "Density")
+  abline(v = threshold, col = "red", lty = 2, lwd = 2)
+  legend("topright", bty = "n", col = c("red", NA), lty = c(2, NA), lwd = c(2, NA),
+         legend = c(paste("Threshold =", threshold),
+                    sprintf("%.1f%% of values above", 100 * mean(x > threshold, na.rm = TRUE))))
+}
+
 # Plot Saving Helpers
 save_and_print_plot <- function(plot_obj_func, filename, show_plot=TRUE, ...) { tryCatch({ png(filename,...); plot_obj_func(); dev.off() }, error=function(e){warning(paste("Fail save:",basename(filename)),call.=FALSE)}); if(show_plot){tryCatch({plot_obj_func()},error=function(e){})}; Sys.sleep(0.05) }
 save_and_print_ggplot <- function(plot_obj, filename, show_plot=TRUE, ...) { tryCatch({ ggsave(filename, plot=plot_obj, ...) }, error=function(e){warning(paste("Fail save ggplot:",basename(filename)),call.=FALSE)}); if(show_plot){tryCatch({print(plot_obj)},error=function(e){})}; Sys.sleep(0.05) }
@@ -1854,7 +1895,7 @@ server <- function(input, output, session) {
       }
 
       if ("summary" %in% all_selected)
-        save_plot_auto("DataSummary", function() summaryPlot(df_save, pollutant = poll_save))
+        save_plot_auto("DataSummary", function() data_summary_plot(df_save, poll_save, data_type_mode, start_d, end_d, site_tz, paste("Data Summary", poll_save, "-", sname)))
       if ("calendar" %in% all_selected)
         save_plot_auto("Calendar", function() calendarPlot(daily_max_df(df_save), pollutant = poll_save, cols = cols_aqi, breaks = brks, main = paste("Calendar", poll_save, "-", sname)))
       if ("timeseries" %in% all_selected)
@@ -1867,8 +1908,10 @@ server <- function(input, output, session) {
         save_plot_auto("TrendLevel", function() trendLevel(df_save, pollutant = poll_save, x = "month", y = "hour", cols = cols_aqi, breaks = brks))
       if ("timeprop" %in% all_selected) {
         save_plot_auto("AQI_Proportions", function() {
-          df_p <- df_save %>% mutate(aqi_cat = cut(.data[[poll_save]], breaks = brks, labels = labs, include.lowest = TRUE, right = FALSE)) %>% filter(!is.na(aqi_cat))
-          timeProp(df_p, pollutant = "aqi_cat", avg.time = "week", cols = cols_aqi, key.columns = 3)
+          df_p <- df_save %>% mutate(aqi_cat = droplevels(aqi_category(.data[[poll_save]], brks, labs))) %>% filter(!is.na(aqi_cat))
+          # Colours only for the categories present: openair re-spreads a longer palette.
+          timeProp(df_p, pollutant = poll_save, proportion = "aqi_cat", avg.time = "week",
+                   cols = cols_aqi[match(levels(df_p$aqi_cat), labs)], key.columns = 3)
         })
       }
       if ("scatter_met" %in% all_selected && "temp" %in% names(df_save))
@@ -1879,8 +1922,8 @@ server <- function(input, output, session) {
           if (length(cc) >= 2) corPlot(df_save[, cc], pollutants = cc)
         })
       }
-      if ("kernelexceed" %in% all_selected && all(c("ws", "wd") %in% names(df_save)))
-        save_plot_auto("KernelExceed", function() try(kernelExceed(df_save, x = poll_save), silent = TRUE))
+      if ("kernelexceed" %in% all_selected && !is.null(usg_threshold(poll_save)))
+        save_plot_auto("KernelDensity", function() kernel_density_plot(df_save[[poll_save]], usg_threshold(poll_save), poll_save, paste("Kernel Density -", poll_save, "-", sname)))
 
       # Meteorological / source plots (hourly only)
       if (data_type_mode == "hourly") {
@@ -2434,7 +2477,7 @@ server <- function(input, output, session) {
     if ("kernelexceed" %in% selected_plots) {
       plot_card_list <- c(plot_card_list, list(
         bslib::card(
-          bslib::card_header("Kernel Density Exceedance Plot"),
+          bslib::card_header("Kernel Density (with USG threshold)"),
           bslib::card_body(
             plotOutput("dyn_kernelexceed_plot", height = "800px")
           )
@@ -2474,19 +2517,9 @@ server <- function(input, output, session) {
   # --- Summary Plot ---
   output$dyn_summary_plot <- render_plot_safely(quote({
     shiny::validate(need(poll %in% names(df), "Missing pollutant"))
-    
-    # Correct the period argument for summaryPlot. It requires a longer period 
-    # like "months" or "years" to generate its multi-panel layout. "months" is a
-    # good default for data spanning several months to a few years.
-    
-    # Calculate data duration in days
-    duration_days <- as.numeric(difftime(max(df$date, na.rm=TRUE), min(df$date, na.rm=TRUE), units = "days"))
-    
-    # Choose a sensible period: 'years' if more than 2 years of data, otherwise 'months'
-    plot_period <- if (duration_days > 730) "years" else "months"
-    
-    summaryPlot(df, pollutant = poll, period = plot_period,
-                main = paste("Data Summary for", poll, "-", sinfo$name_long))
+    # openair 3.0 removed summaryPlot(); this heatmap shows the same data capture.
+    data_summary_plot(df, poll, rv$current_datatype, input$start_date_input, input$end_date_input,
+                      sinfo$tz, paste("Data Summary for", poll, "-", sinfo$name_long))
   }), "SummaryPlot")
   
   # Calendar Plots (Adapted for Daily/Hourly)
@@ -2497,30 +2530,20 @@ server <- function(input, output, session) {
     req(breaks, labels, colors)
     shiny::validate(need(poll %in% names(df), paste("Missing", poll)))
     
-    start_year <- year(input$start_date_input)
-    end_year <- year(input$end_date_input)
+    # openair >= 3.0 draws with ggplot2, so par(mfrow) cannot stack one calendar per
+    # year (only the last one showed). One call with every year draws all months.
+    years <- year(input$start_date_input):year(input$end_date_input)
+    plot_title <- paste(sinfo$name_long, if(rv$current_datatype=="hourly") "Daily Max Hrly" else "Daily", poll,"-", paste(unique(range(years)), collapse = "-"))
     
-    generate_cal_plot <- function(target_year) {
-      plot_title <- paste(sinfo$name_long, if(rv$current_datatype=="hourly") "Daily Max Hrly" else "Daily", poll,"-", target_year)
-      
-      if (rv$current_datatype == "hourly") {
-        site_tz <- rv$selected_site_info$tz
-        plot_data <- df %>% filter(lubridate::year(date) == target_year) %>% mutate(day_date = as.Date(date, tz = site_tz)) %>% group_by(day_date) %>% summarise("{poll}" := if(all(is.na(.data[[poll]]))) NA_real_ else max(.data[[poll]], na.rm = TRUE), .groups = 'drop') %>% rename(date = day_date) %>% as.data.frame()
-      } else {
-        plot_data <- df %>% filter(lubridate::year(date) == target_year) %>% as.data.frame()
-      }
-      
-      shiny::validate(need(nrow(plot_data) > 0, paste("No data for calendar plot in", target_year)))
-      calendarPlot(plot_data, pollutant = poll, main = plot_title, cols = colors, breaks = breaks, key.footer = paste(labels, collapse=" | "), key.position = "right")
-    }
-    
-    if(start_year != end_year) {
-      par(mfrow = c(2, 1)) 
-      generate_cal_plot(start_year)
-      generate_cal_plot(end_year)
+    if (rv$current_datatype == "hourly") {
+      site_tz <- rv$selected_site_info$tz
+      plot_data <- df %>% mutate(day_date = as.Date(date, tz = site_tz)) %>% group_by(day_date) %>% summarise("{poll}" := if(all(is.na(.data[[poll]]))) NA_real_ else max(.data[[poll]], na.rm = TRUE), .groups = 'drop') %>% rename(date = day_date) %>% as.data.frame()
     } else {
-      generate_cal_plot(start_year)
+      plot_data <- df %>% as.data.frame()
     }
+    
+    shiny::validate(need(nrow(plot_data) > 0, "No data for calendar plot"))
+    calendarPlot(plot_data, pollutant = poll, year = years, main = plot_title, cols = colors, breaks = breaks, key.footer = paste(labels, collapse=" | "), key.position = "right")
   }), "Cal1 (AQI Colors)")
   
   # Calendar Plot 2: Annotated with Wind Direction (Corrected for Hourly)
@@ -2529,56 +2552,43 @@ server <- function(input, output, session) {
     req(breaks, labels, colors)
     shiny::validate(need(all(c(poll, "ws", "wd") %in% names(df)), "Missing pollutant, ws, or wd for wind annotation."))
     
-    start_year <- year(input$start_date_input)
-    end_year <- year(input$end_date_input)
+    # One call with every year (see Calendar Plot 1: par(mfrow) does not apply to ggplot2).
+    years <- year(input$start_date_input):year(input$end_date_input)
+    plot_title <- paste("Wind Direction on High Days -", poll, "-", paste(unique(range(years)), collapse = "-"))
     
-    generate_wind_cal_plot <- function(target_year) {
-      plot_title <- paste("Wind Direction on High Days -", poll, "-", target_year)
+    plot_data <- NULL # Initialize plot_data
       
-      plot_data <- NULL # Initialize plot_data
+    if (rv$current_datatype == "hourly") {
+      site_tz <- rv$selected_site_info$tz
+      # --- NEW ROBUST AGGREGATION LOGIC FOR HOURLY DATA ---
+      plot_data <- df %>%
+        mutate(day_date = as.Date(date, tz = site_tz)) %>%
+        group_by(day_date) %>%
+        # Create daily summaries: max pollutant, mean ws, and vector-mean wd
+        # (a plain mean of 350 and 10 degrees would point the arrow south)
+        summarise(
+          "{poll}" := if(all(is.na(.data[[poll]]))) NA_real_ else max(.data[[poll]], na.rm = TRUE),
+          wd = vector_mean_direction(ws, wd),
+          ws = if(all(is.na(ws))) NA_real_ else mean(ws, na.rm = TRUE),
+          .groups = 'drop'
+        ) %>%
+        # Now filter out any remaining days with incomplete data
+        filter(!is.na(.data[[poll]]) & !is.na(ws) & !is.na(wd)) %>%
+        rename(date = day_date) %>%
+        as.data.frame()
       
-      if (rv$current_datatype == "hourly") {
-        site_tz <- rv$selected_site_info$tz
-        # --- NEW ROBUST AGGREGATION LOGIC FOR HOURLY DATA ---
-        plot_data <- df %>%
-          filter(lubridate::year(date) == target_year) %>%
-          mutate(day_date = as.Date(date, tz = site_tz)) %>%
-          group_by(day_date) %>%
-          # Create daily summaries: max pollutant, mean ws, and vector-mean wd
-          # (a plain mean of 350 and 10 degrees would point the arrow south)
-          summarise(
-            "{poll}" := if(all(is.na(.data[[poll]]))) NA_real_ else max(.data[[poll]], na.rm = TRUE),
-            wd = vector_mean_direction(ws, wd),
-            ws = if(all(is.na(ws))) NA_real_ else mean(ws, na.rm = TRUE),
-            .groups = 'drop'
-          ) %>%
-          # Now filter out any remaining days with incomplete data
-          filter(!is.na(.data[[poll]]) & !is.na(ws) & !is.na(wd)) %>%
-          rename(date = day_date) %>%
-          as.data.frame()
-        
-      } else { # Daily data logic remains the same
-        plot_data <- df %>%
-          filter(lubridate::year(date) == target_year) %>%
-          filter(!is.na(ws) & !is.na(wd)) %>%
-          as.data.frame()
-      }
-      
-      # Validation after filtering
-      shiny::validate(need(nrow(plot_data) > 0, paste("No data with valid ws/wd found for wind calendar in", target_year)))
-      
-      calendarPlot(plot_data, pollutant = poll, main = plot_title, cols = colors, breaks = breaks,
-                   annotate = "wd", annotate.args = list(col = "black", lwd=0.8),
-                   key.footer = "Wind Vectors", key.position = "right")
+    } else { # Daily data logic remains the same
+      plot_data <- df %>%
+        filter(!is.na(ws) & !is.na(wd)) %>%
+        as.data.frame()
     }
     
-    if(start_year != end_year) {
-      par(mfrow = c(2, 1))
-      generate_wind_cal_plot(start_year)
-      generate_wind_cal_plot(end_year)
-    } else {
-      generate_wind_cal_plot(start_year)
-    }
+    # Validation after filtering
+    shiny::validate(need(nrow(plot_data) > 0, "No data with valid ws/wd found for wind calendar"))
+    
+    calendarPlot(plot_data, pollutant = poll, year = years, main = plot_title, cols = colors, breaks = breaks,
+                 annotate = "wd", annotate.args = list(col = "black", lwd=0.8),
+                 key.footer = "Wind Vectors", key.position = "right")
   }), "Cal2 (Wind Vectors)")
   
   
@@ -2868,13 +2878,17 @@ server <- function(input, output, session) {
     
     # Create the AQI category column
     df_prop <- df %>%
-      mutate(aqi_cat = cut(.data[[poll]], breaks = breaks, labels = labels, include.lowest = TRUE, right = FALSE)) %>%
+      mutate(aqi_cat = droplevels(aqi_category(.data[[poll]], breaks, labels))) %>%
       filter(!is.na(aqi_cat))
     
     validate(need(nrow(df_prop) > 0, "No valid AQI categories to plot."))
     
-    timeProp(df_prop, pollutant = "aqi_cat", avg.time = "week", 
-             cols = colors, key.columns = 3,
+    # The category is the 'proportion' that splits each bar, not the pollutant
+    # (openair would try to average a factor and draw nothing).
+    # Colours only for the categories present: openair re-spreads a longer palette
+    # over the levels it finds (Moderate would be drawn orange).
+    timeProp(df_prop, pollutant = poll, proportion = "aqi_cat", avg.time = "week", 
+             cols = colors[match(levels(df_prop$aqi_cat), labels)], key.columns = 3,
              main = paste("Weekly Proportions of AQI Levels for", poll))
   }), "TimeProp")
   
@@ -2986,44 +3000,16 @@ server <- function(input, output, session) {
                    main = paste("Seasonal Percentile Roses -", poll, "-", sinfo$name_long))
   }), "PercentileRoseMulti")
   
-  # --- Kernel Exceedance Plot ---
-  # Replace the existing output$dyn_kernelexceed_plot block (around line 1956-1973)
+  # --- Kernel Density Plot (with the USG threshold) ---
+  # openair removed kernelExceed(), so this card always said "not available".
   output$dyn_kernelexceed_plot <- render_plot_safely(quote({
     shiny::validate(need(poll %in% names(df), "Missing pollutant"))
     
-    # Define thresholds based on data type and pollutant
-    threshold <- if(rv$current_datatype == "hourly") {
-      if(poll == "OZONE") 0.070 else if(poll == "PM2.5") 35.4 else NULL
-    } else { # daily
-      if(poll == "OZONE_8HR_PPB") 70 else if(poll == "PM25_24HR_UGM3") 35.4 else NULL
-    }
-    
+    threshold <- usg_threshold(poll)
     shiny::validate(need(!is.null(threshold), paste("Threshold not defined for pollutant:", poll)))
     
-    # Check if the function exists and try to use it
-    if(exists("kernelExceed", where = "package:openair", mode = "function")) {
-      tryCatch({
-        kernelExceed(df,
-                     x = poll,
-                     data.thresh = threshold,
-                     main = paste("Kernel Density Exceedance -", poll, ">", threshold, "-", sinfo$name_long))
-      }, error = function(e) {
-        # If kernelExceed fails, create a simple density plot with threshold line
-        plot.new()
-        plot(density(df[[poll]], na.rm = TRUE), 
-             main = paste("Density Plot -", poll, "(threshold:", threshold, ")"),
-             xlab = poll, ylab = "Density")
-        abline(v = threshold, col = "red", lty = 2, lwd = 2)
-        legend("topright", legend = paste("Threshold =", threshold), 
-               col = "red", lty = 2, lwd = 2, bty = "n")
-      })
-    } else {
-      # Function doesn't exist - create alternative visualization
-      plot.new()
-      title(main = "kernelExceed function not available", 
-            sub = "This function may not be available in your openair version", 
-            col.main = "red", cex.sub = 0.8)
-    }
+    kernel_density_plot(df[[poll]], threshold, poll,
+                        paste("Kernel Density -", poll, "(USG above", threshold, ") -", sinfo$name_long))
   }), "KernelExceed")
 
   # ADD THESE NEW DOWNLOAD HANDLERS:
@@ -3233,11 +3219,13 @@ server <- function(input, output, session) {
       results$desc_stats_table <- tibble(Message = "No numeric variables found for descriptive stats.")
     }
     
-    # --- 3. Wind Summary (Using openair helper) ---
+    # --- 3. Wind Summary ---
     if (all(c("ws", "wd") %in% names(df_stats))) {
-      wr_data <- tryCatch(windRose(df_stats, ws = "ws", wd = "wd", plot = FALSE), error = function(e) NULL)
-      if (!is.null(wr_data)) {
-        calm_freq <- wr_data$calm.freq
+      valid_wind <- !is.na(df_stats$ws) & !is.na(df_stats$wd)
+      if (any(valid_wind)) {
+        # Calm = zero wind speed, as in openair's windRose (calm.thresh = 0). Computed
+        # here because openair 3.x's windRose(plot = FALSE) no longer returns calm.freq.
+        calm_freq <- 100 * mean(df_stats$ws[valid_wind] == 0)
         mean_scalar_ws <- mean(df_stats$ws, na.rm = TRUE)
         
         results$mean_scalar_ws <- mean_scalar_ws
@@ -3252,7 +3240,7 @@ server <- function(input, output, session) {
         
         results$wind_summary_text <- paste(
           sprintf("Mean Scalar Wind Speed: %.2f m/s", mean_scalar_ws),
-          sprintf("Frequency of Calm (<%.1f m/s): %.1f%%", wr_data$calm.ws, calm_freq),
+          sprintf("Frequency of Calm (0 m/s): %.1f%%", calm_freq),
           sprintf("Vector Mean Wind Speed: %.2f m/s", vector_mean_ws),
           sprintf("Vector Mean Wind Direction: %.1f degrees", vector_mean_wd),
           sep = "\n"
