@@ -68,6 +68,13 @@ PM25_DAILY_24HR_BREAKS_UGM3 <- c(0, 9.0, 35.4, 55.4, 150.4, 250.4, Inf) # UGM3 v
 PM25_DAILY_24HR_LABELS <- c("Good", "Moderate", "USG", "Unhealthy", "Very Unhealthy", "Hazardous")
 PM25_DAILY_24HR_COLS <- c("green", "yellow", "orange", "red", "purple", "maroon")
 
+# NOAA retired the ISD global-hourly archive that worldmet::importNOAA() reads:
+# its last records are 2025-08-27 ~06 UTC (NCEI access/2026/ returns 404). 2025-08-25
+# is the last local-standard-time day it covers in every US time zone, so any hourly
+# period ending later gets its weather from IEM ASOS instead.
+ISD_END_DATE <- as.Date("2025-08-27")
+ISD_LAST_FULL_LST_DAY <- as.Date("2025-08-25")
+
 # Enhanced Plot Choices (Categorized)
 plot_choices <- list(
   "Temporal Trends (Both Hourly/Daily)" = c(
@@ -437,12 +444,19 @@ fetch_and_cache_met_data <- function(met_code, start_d, end_d, data_type_mode, s
   data_r <- NULL
   met_source_used <- NA_character_  # Track which source actually supplied the data
   if (data_type_mode == "hourly") {
-    # Check if we should use IEM ASOS (for recent data) or NOAA ISH
-    # If the end date is within 4 days of today, NOAA ISH likely has a lag.
+    # Use IEM ASOS for recent data (NOAA lags) and for any period NOAA ISD no longer
+    # covers: NOAA retired ISD global-hourly, and its data stop on 2025-08-27.
     is_recent <- as.numeric(Sys.Date() - end_d) <= 4
+    isd_covers_period <- end_d <= ISD_LAST_FULL_LST_DAY
+    use_iem <- is_recent || !isd_covers_period
 
-    if (is_recent) {
-      rv_log_update(" > INFO: Recent dates selected. Using IEM ASOS (Real-time) instead of NOAA ISH to bypass lag.")
+    if (use_iem) {
+      if (!isd_covers_period) {
+        rv_log_update(paste0(" > INFO: NOAA ISD hourly data stop on ", format(ISD_END_DATE),
+                             " (NOAA retired the archive). Using IEM ASOS for this period."))
+      } else {
+        rv_log_update(" > INFO: Recent dates selected. Using IEM ASOS (Real-time) instead of NOAA ISH to bypass lag.")
+      }
       # Find the call sign and state for this code
       station_info <- us_ish_stations %>% filter(code == met_code) %>% head(1)
       station_call_sign <- station_info$call
@@ -451,15 +465,22 @@ fetch_and_cache_met_data <- function(met_code, start_d, end_d, data_type_mode, s
       if (!is.null(station_call_sign) && length(station_call_sign) > 0 && nchar(station_call_sign) >= 3) {
         data_r <- fetch_process_iem_hourly_met(station_call_sign, station_state, start_d, end_d, plot_dir)
         if (!is.null(data_r) && nrow(data_r) > 0) {
-          met_source_used <- "IEM ASOS (Real-time)"
+          met_source_used <- if (is_recent) "IEM ASOS (Real-time)" else paste0("IEM ASOS (NOAA ISD ended ", format(ISD_END_DATE), ")")
           rv_log_update(paste(" > SUCCESS: Fetched", nrow(data_r), "hourly rows from IEM ASOS (", station_call_sign, ")."))
         }
       }
     }
 
-    # Fallback to NOAA ISH if IEM failed or if data is not "recent"
-    if (is.null(data_r) || nrow(data_r) == 0) {
-      if (is_recent) rv_log_update(" > WARNING: IEM fallback failed. Attempting NOAA ISH...")
+    # Fallback to NOAA ISH if IEM failed or if data is not "recent".
+    # ISD has nothing after 2025-08-27, so skip it for periods that start later.
+    if ((is.null(data_r) || nrow(data_r) == 0) && use_iem && start_d > ISD_LAST_FULL_LST_DAY) {
+      rv_log_update(paste0(" > WARNING: IEM ASOS returned no data, and NOAA ISD has none after ",
+                           format(ISD_END_DATE), ". No hourly MET data for this period."))
+    } else if (is.null(data_r) || nrow(data_r) == 0) {
+      if (use_iem && !isd_covers_period) {
+        rv_log_update(paste0(" > WARNING: IEM ASOS returned no data. Trying NOAA ISH, but its data stop on ",
+                             format(ISD_END_DATE), ", so later hours will have no weather."))
+      } else if (use_iem) rv_log_update(" > WARNING: IEM fallback failed. Attempting NOAA ISH...")
       else rv_log_update(" > INFO: Using NOAA ISH (Quality Controlled) source.")
 
       met_data_list <- list()
@@ -1126,7 +1147,7 @@ ui <- page_sidebar(
     width = 300,
     h4("1. Analysis Type"),
     radioButtons("data_type", NULL,
-                 choices = c("Hourly (AirNow Hourly + NOAA ISH)" = "hourly",
+                 choices = c("Hourly (AirNow Hourly + NOAA ISH to Aug 2025 / IEM ASOS)" = "hourly",
                              "Daily (AirNow Daily + IEM ASOS)" = "daily"),
                  selected = "hourly"),
     hr(),
@@ -1403,15 +1424,18 @@ server <- function(input, output, session) {
       ))
     }
     
-    # B. Check for NOAA Lag (Warning - Hourly Only)
+    # B. Hourly MET source notes (Hourly Only)
     if (input$data_type == "hourly") {
       date_diff <- as.numeric(Sys.Date() - input$end_date_input)
-      if (date_diff <= 2) {
+      if (input$end_date_input > ISD_LAST_FULL_LST_DAY) {
         return(tags$div(
-          class = "alert alert-warning",
+          class = "alert alert-info",
           style = "font-size: 0.85em; padding: 5px 10px; margin-top: 10px; border-radius: 4px;",
           bsicons::bs_icon("info-circle"),
-          tags$strong(" Note: "), "Hourly MET data from NOAA may have a lag of 1-3 days. Data for very recent dates may be incomplete."
+          tags$strong(" Note: "),
+          paste0("NOAA retired its ISD hourly archive, and its data stop on ", format(ISD_END_DATE),
+                 ". Hourly weather for this range comes from IEM ASOS instead.",
+                 if (date_diff <= 2) " Data for the last day or two may still be incomplete." else "")
         ))
       }
     }

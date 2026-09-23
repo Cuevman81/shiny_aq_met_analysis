@@ -37,8 +37,9 @@ An R Shiny application for site-specific analysis of air quality and meteorologi
 ## Data Sources
 
 -   **Air Quality**: [EPA AirNow](https://www.airnow.gov/)
--   **Meteorology (Hourly)**: Dual-source. [NOAA ISH](https://www.ncei.noaa.gov/products/land-based-station/integrated-surface-database) for long-term data and **[Iowa Environmental Mesonet (IEM)](https://mesonet.agron.iastate.edu/request/asos.py)** for real-time Hourly ASOS observations.
+-   **Meteorology (Hourly)**: Dual-source. [NOAA ISH](https://www.ncei.noaa.gov/products/land-based-station/integrated-surface-database) for periods ending by 25 Aug 2025, and **[Iowa Environmental Mesonet (IEM)](https://mesonet.agron.iastate.edu/request/asos.py)** routine hourly ASOS reports for recent dates and for any period ending later. NOAA retired the ISD global-hourly archive, and its data stop on 27 Aug 2025.
 -   **Meteorology (Daily)**: [IEM ASOS Daily](https://mesonet.agron.iastate.edu/request/daily.phtml)
+-   **Time convention**: everything is in Local Standard Time (no DST). Hourly rows are hour-beginning, as AirNow publishes them (the 05:00 row is the 05:00-05:59 average), and each is paired with the weather report observed during that hour. Daily rows are the LST calendar day AirNow gives as the "Valid date".
 
 ## Author
 
