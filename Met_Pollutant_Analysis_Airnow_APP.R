@@ -3062,7 +3062,9 @@ server <- function(input, output, session) {
                                  pattern = "\\.(png|pdf|svg)$")
       }
       if (length(plot_files) > 0) {
-        zip(file, plot_files, flags = "-j")
+        # zip::zip (library(zip) masks utils::zip) has no 'flags'; cherry-pick stores
+        # the files at the top level of the archive, without their folder.
+        zip::zip(file, plot_files, mode = "cherry-pick")
       } else {
         showNotification("No saved plot files found to download. Run an analysis first.", type = "warning")
       }
