@@ -269,8 +269,8 @@ if(!is.null(sites_data_full) && nrow(sites_data_full) > 0) {
 # CACHING Helper for Pollutant Data
 fetch_and_cache_pollutant_data <- function(site_info, selected_pollutant_code, start_d, end_d, data_type_mode, rv_log_update) {
   # Generate a unique key for this request using a hash
-  # logic_version: v5_FINAL_LST
-  cache_key <- digest::digest(list("v5_FINAL_LST", site_info$aqs_id, selected_pollutant_code, start_d, end_d, data_type_mode))
+  # logic_version: v6_CompleteOnly (only complete, settled fetches are cached)
+  cache_key <- digest::digest(list("v6_CompleteOnly", site_info$aqs_id, selected_pollutant_code, start_d, end_d, data_type_mode))
   cache_dir <- "app_cache"
   dir.create(cache_dir, showWarnings = FALSE)
   cache_file <- file.path(cache_dir, paste0(cache_key, ".rds"))
@@ -297,6 +297,7 @@ fetch_and_cache_pollutant_data <- function(site_info, selected_pollutant_code, s
   
   # --- Data Fetching Logic (moved from the reactive) ---
   data_r <- NULL
+  n_failed <- 0L
   if (data_type_mode == "hourly") {
     # 1. Expand the UTC hour sequence to ensure we catch the local day boundaries
     # We fetch -24h to +24h to be absolutely safe during timezone shifts
@@ -314,6 +315,7 @@ fetch_and_cache_pollutant_data <- function(site_info, selected_pollutant_code, s
                                     target_tz = site_tz, target_lat = site_info$lat, target_lon = site_info$lon,
                                     .progress = TRUE, .options = furrr_options(seed = TRUE, packages = c("readr", "dplyr", "lubridate")))
     plan(sequential)
+    reads <- split_failed_reads(data_r); data_r <- reads$data; n_failed <- reads$n_failed
     
     if(!is.null(data_r)) {
       # Filter to only the requested dates in the local timezone
@@ -326,20 +328,45 @@ fetch_and_cache_pollutant_data <- function(site_info, selected_pollutant_code, s
     data_r <- purrr::map_dfr(unique(all_urls), read_process_airnow_daily,
                              target_aqs_id = site_info$aqs_id, target_param_name = selected_pollutant_code,
                              target_lat = site_info$lat, target_lon = site_info$lon, .progress = TRUE)
+    reads <- split_failed_reads(data_r); data_r <- reads$data; n_failed <- reads$n_failed
     if (!is.null(data_r)) { data_r <- data_r %>% filter(date >= start_d, date <= end_d) }
   }
   
-  # --- Save to cache if data was successfully fetched ---
-  if (!is.null(data_r) && nrow(data_r) > 0) {
+  # --- Save to cache only if the fetch is complete and settled ---
+  # A file that failed to read (other than 404/403) leaves a hole, and AirNow
+  # rewrites the last 48 h of files every hour, so neither result is final.
+  if (n_failed > 0) {
+    rv_log_update(paste(" > WARNING:", n_failed, "AirNow file(s) could not be read; the data may have gaps and were not cached."))
+  }
+  if (!is.null(data_r) && nrow(data_r) > 0 && n_failed == 0 && !is_unsettled_period(end_d)) {
     tryCatch({
       saveRDS(data_r, cache_file)
       rv_log_update(" > Successfully saved new pollutant data to cache.")
     }, error = function(e) {
       rv_log_update(paste(" > WARNING: Failed to save pollutant data to cache:", e$message))
     })
+  } else if (!is.null(data_r) && nrow(data_r) > 0 && is_unsettled_period(end_d)) {
+    rv_log_update(" > INFO: Period includes the last 3 days, which AirNow/IEM are still updating; not cached.")
   }
   
   return(data_r)
+}
+
+# TRUE when a period ends within the last 3 days: AirNow rewrites the last 48 h of
+# hourly files every hour (Hourly Data File fact sheet) and IEM is still appending.
+is_unsettled_period <- function(end_d) {
+  end_d >= Sys.Date() - 3
+}
+
+# The AirNow readers return a one-column row (.read_failed = url) for a file that
+# could not be read for a reason other than 404/403. Split those rows off and count
+# them, so the caller can warn and does not cache data with gaps.
+split_failed_reads <- function(data_r) {
+  if (is.null(data_r) || !(".read_failed" %in% names(data_r))) return(list(data = data_r, n_failed = 0L))
+  n_failed <- sum(!is.na(data_r$.read_failed))
+  data_r <- data_r %>% filter(is.na(.read_failed)) %>% select(-.read_failed)
+  if (nrow(data_r) == 0) data_r <- NULL
+  list(data = data_r, n_failed = n_failed)
 }
 
 # Speed-weighted vector mean of wind direction (degrees, 0-360). Directions must not
@@ -546,8 +573,8 @@ fetch_and_cache_met_data <- function(met_code, start_d, end_d, data_type_mode, s
     attr(data_r, "met_source") <- met_source_used
   }
 
-  # --- Save to cache if data was successfully fetched ---
-  if (!is.null(data_r) && nrow(data_r) > 0) {
+  # --- Save to cache if data was successfully fetched (and is no longer being updated) ---
+  if (!is.null(data_r) && nrow(data_r) > 0 && !is_unsettled_period(end_d)) {
     tryCatch({
       saveRDS(data_r, cache_file)
       rv_log_update(" > Successfully saved new MET data to cache.")
@@ -572,7 +599,7 @@ get_us_ish_metadata <- function(cache_dir = "app_data") {
     }
   }
   
-  print("Downloading US MET station metadata state by state... (this may take over a minute)")
+  print("Downloading US MET station metadata (NOAA isd-history, one file)...")
   
   # List of US states and territories
   us_states_territories <- c("AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", 
@@ -582,22 +609,17 @@ get_us_ish_metadata <- function(cache_dir = "app_data") {
                              "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
                              "AS", "GU", "MP", "PR", "VI")
   
-  all_us_meta_list <- tryCatch({
-    purrr::map(us_states_territories, function(st) {
-      Sys.sleep(0.1)
-      state_meta <- worldmet::getMeta(state = st)
-      if (!is.null(state_meta) && nrow(state_meta) > 0) {
-        state_meta <- state_meta %>% dplyr::mutate(state = st)
-      }
-      return(state_meta)
-    }, .progress = TRUE)
+  # One download of isd-history.csv, filtered locally. (getMeta(state = st) per state
+  # re-downloaded the whole 2.9 MB file twice per call and drew a map: 110 downloads.)
+  all_us_meta <- tryCatch({
+    meta <- worldmet::getMeta(plot = FALSE, end.year = "current")
+    meta %>% dplyr::filter(st %in% us_states_territories) %>% dplyr::mutate(state = st)
   }, error = function(e) {
-    warning("Could not download all MET station metadata from worldmet. Error: ", e$message, immediate. = TRUE)
+    warning("Could not download MET station metadata from worldmet. Error: ", e$message, immediate. = TRUE)
     return(NULL)
   })
   
-  if (!is.null(all_us_meta_list)) {
-    all_us_meta <- bind_rows(all_us_meta_list)
+  if (!is.null(all_us_meta)) {
     
     if (nrow(all_us_meta) > 0) {
       us_meta_clean <- all_us_meta %>%
@@ -705,7 +727,9 @@ read_and_process_airnow_hourly <- function(url, target_aqs_id, target_param, tar
   # NOTE: We deliberately do NOT map warnings to NULL here. read_delim emits
   # benign parsing warnings on otherwise-valid AirNow files; discarding the
   # whole hour on any warning silently drops good data. We only treat genuine
-  # read errors (e.g. missing 404/403 files) as "no data".
+  # read errors (e.g. missing 404/403 files) as "no data". Any other read error
+  # returns a .read_failed marker row so the caller knows the data have a gap.
+  read_failed <- FALSE
   data <- tryCatch({
     suppressWarnings(
       read_delim(url, "|", col_names = col_names, col_types = col_types_spec,
@@ -715,10 +739,12 @@ read_and_process_airnow_hourly <- function(url, target_aqs_id, target_param, tar
   }, error = function(e) {
        if (!grepl("404|403", e$message)) {
          warning(paste("ERR reading URL:", url, e$message), call. = FALSE)
+         read_failed <<- TRUE
        }
        NULL
      })
   
+  if (read_failed) return(tibble(.read_failed = url))
   if (is.null(data) || nrow(data) == 0) return(NULL)
   
   filt_data <- data %>% filter(aqsid == target_aqs_id & param == target_param)
@@ -762,6 +788,7 @@ read_process_airnow_daily <- function(url, target_aqs_id, target_param_name, tar
   
   # See read_and_process_airnow_hourly: suppress benign parse warnings rather
   # than discarding the whole day's data on any warning.
+  read_failed <- FALSE
   data <- tryCatch({
     suppressWarnings(
       read_delim(url, "|", col_names = col_names, col_types = col_types_spec,
@@ -769,10 +796,14 @@ read_process_airnow_daily <- function(url, target_aqs_id, target_param_name, tar
                  progress = FALSE, guess_max = 10000)
     )
   }, error = function(e) {
-    if (!grepl("404|403", e$message)) { warning(paste("ERR reading Daily URL:", url, e$message), call. = FALSE) }
+    if (!grepl("404|403", e$message)) {
+      warning(paste("ERR reading Daily URL:", url, e$message), call. = FALSE)
+      read_failed <<- TRUE
+    }
     NULL
   })
   
+  if (read_failed) return(tibble(.read_failed = url))
   if (is.null(data) || nrow(data) == 0) { return(NULL) }
   
   filt_data <- data %>%
@@ -1689,6 +1720,7 @@ server <- function(input, output, session) {
         lat = selected_site_row$Latitude[1],
         lon = selected_site_row$Longitude[1],
         tz = site_tz_lst,
+        name_short = gsub("[^A-Za-z0-9_]", "", selected_site_row$`Local Site Name`[1]),
         name_long = selected_site_row$`Local Site Name`[1]
       )
       
