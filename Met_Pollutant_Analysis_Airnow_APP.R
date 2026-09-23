@@ -2651,21 +2651,34 @@ server <- function(input, output, session) {
       distinct(date, .keep_all = TRUE) %>%
       mutate(
         u = ws * sin(wd * pi / 180), v = ws * cos(wd * pi / 180),
-        # Use numeric day of year and weekday as predictors
+        # Use numeric day of year, month and weekday as predictors
         jday = yday(date),
+        mon = month(date),
         weekday = wday(date, label = TRUE)
       )
     
-    shiny::validate(need(nrow(model_data) > 100, "Wind normalization requires at least 100 complete data points."))
+    # Too little data for the model: say so instead of drawing a failure (return() ends this plot only).
+    n_months <- length(unique(model_data$mon))
+    too_short <- if (nrow(model_data) <= 100) {
+      paste0("needs over 100 ", if (rv$current_datatype == "daily") "days" else "hours", " with wind data; this run has ", nrow(model_data))
+    } else if (rv$current_datatype != "daily" && n_months < 5) {
+      paste0("needs 5+ months of hourly data; this run has ", n_months)
+    }
+    if (!is.null(too_short)) { plot.new(); title(paste0("WindNorm Skipped\n(", too_short, ")")); return(invisible()) }
     
     # --- MODIFICATION START: Simpler model for daily data, more robust validation ---
+    # A cyclic ('cc') smooth wraps at the first and last value present unless knots set its period
+    # (mgcv ?smooth.construct.cc.smooth.spec). A Mar-Oct run then forced October to equal March and
+    # drew a false trend across the season. Both seasonal cycles below are the calendar year.
     if (rv$current_datatype == "daily") {
       # A simpler model for daily data that is less prone to errors with few months
-      gam_model <- gam(as.formula(paste(poll, "~ s(u, v) + s(jday, bs='cc') + weekday")), data = model_data)
+      gam_model <- gam(as.formula(paste(poll, "~ s(u, v) + s(jday, bs='cc') + weekday")), data = model_data,
+                       knots = list(jday = c(0.5, 366.5)))
     } else { # Hourly
-      # Original, more complex model is fine for hourly data
-      shiny::validate(need(length(unique(month(model_data$date))) > 4, "Wind normalization requires data from at least 4 different months for a stable model."))
-      gam_model <- gam(as.formula(paste(poll, "~ s(u, v) + s(hour(date), bs='cc') + s(month(date), bs='cc') + year(date)")), data = model_data)
+      # One knot per month present plus the Dec/Jan wrap point. mgcv's default k = 10 needs 10
+      # different months ("more knots than unique data values"), so 5-9 month runs always failed.
+      gam_model <- gam(as.formula(paste0(poll, " ~ s(u, v) + s(hour(date), bs='cc') + s(mon, bs='cc', k=", n_months + 2, ") + year(date)")),
+                       data = model_data, knots = list(mon = c(0.5, 12.5)))
     }
     # --- MODIFICATION END ---
     
