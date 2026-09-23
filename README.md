@@ -11,7 +11,7 @@ An R Shiny application for site-specific analysis of air quality and meteorologi
     -   **Meteorological & Source (Hourly Only)**: Wind Roses (standard + diurnal), Pollution Roses, Bivariate Polar Plots, Polar Annulus, Percentile Roses, Polar Cluster Analysis, and Stability Analysis.
     -   **Statistical & Diagnostic (Both)**: Data Summary Heatmaps, AQI Category Proportions (TimeProp), Scatter Plots (Pollutant vs Met), Correlation Matrices, and Kernel Density Exceedance.
 -   **Interactive Site Map**: A Leaflet map showing the selected AQS site and nearby MET stations with their distances, to sanity-check the site-to-station pairing.
--   **Data Provenance**: The Statistics tab reports which MET source actually supplied the data (real-time IEM ASOS vs. quality-controlled NOAA ISH) and the station distance.
+-   **Data Provenance**: The Statistics tab reports which MET source actually supplied the data (IEM ASOS vs. quality-controlled NOAA ISH) and the station distance.
 -   **Statistical Summaries**: Detailed metrics for both pollutants and weather, including AQI categories and diurnal patterns.
 -   **Data Export**: Download the final merged dataset as a CSV and **all** generated plots as a ZIP archive in your chosen format (PNG, PDF, or SVG).
 
@@ -37,7 +37,7 @@ An R Shiny application for site-specific analysis of air quality and meteorologi
 ## Data Sources
 
 -   **Air Quality**: [EPA AirNow](https://www.airnow.gov/)
--   **Meteorology (Hourly)**: Dual-source. [NOAA ISH](https://www.ncei.noaa.gov/products/land-based-station/integrated-surface-database) for periods ending by 25 Aug 2025, and **[Iowa Environmental Mesonet (IEM)](https://mesonet.agron.iastate.edu/request/asos.py)** routine hourly ASOS reports for recent dates and for any period ending later. NOAA retired the ISD global-hourly archive, and its data stop on 27 Aug 2025.
+-   **Meteorology (Hourly)**: Dual-source. [NOAA ISH](https://www.ncei.noaa.gov/products/land-based-station/integrated-surface-database) for periods ending by 25 Aug 2025, and **[Iowa Environmental Mesonet (IEM)](https://mesonet.agron.iastate.edu/request/download.phtml)** routine hourly ASOS reports for recent dates and for any period ending later. NOAA retired the ISD global-hourly archive, and its data stop on 27 Aug 2025.
 -   **Meteorology (Daily)**: [IEM ASOS Daily](https://mesonet.agron.iastate.edu/request/daily.phtml)
 -   **Time convention**: everything is in Local Standard Time (no DST). Hourly rows are hour-beginning, as AirNow publishes them (the 05:00 row is the 05:00-05:59 average), and each is paired with the weather report observed during that hour. Daily rows are the LST calendar day AirNow gives as the "Valid date".
 
