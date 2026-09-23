@@ -2148,7 +2148,7 @@ server <- function(input, output, session) {
       leaflet::addCircleMarkers(
         lng = site$lon, lat = site$lat,
         color = "red", fillColor = "red", fillOpacity = 0.9, radius = 8,
-        popup = paste0("<b>AQS Site</b><br>", site$name_long, "<br>ID: ", site$aqs_id)
+        popup = paste0("<b>AQS Site</b><br>", htmltools::htmlEscape(site$name_long), "<br>ID: ", htmltools::htmlEscape(site$aqs_id))
       )
 
     nearby <- tryCatch(nearby_met_stations(), error = function(e) NULL)
@@ -2160,8 +2160,8 @@ server <- function(input, output, session) {
       m <- m %>% leaflet::addCircleMarkers(
         lng = nb$lon, lat = nb$lat,
         color = "blue", fillColor = "blue", fillOpacity = 0.6, radius = 5,
-        popup = paste0("<b>MET Station</b><br>", nb_label,
-                       "<br>ID: ", nb_id,
+        popup = paste0("<b>MET Station</b><br>", htmltools::htmlEscape(nb_label),
+                       "<br>ID: ", htmltools::htmlEscape(nb_id),
                        "<br>", sprintf("%.1f km", nb$distance_km))
       ) %>%
         leaflet::fitBounds(
