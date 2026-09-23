@@ -328,7 +328,7 @@ fetch_process_iem_hourly_met <- function(station_call_sign, station_state, start
   # Build the URL based on the user provided Python script logic
   # IEM dates are in UTC by default.
   # We fetch 2 extra days to ensure we have enough "buffer" UTC hours 
-  # to fill a full Local Standard Time day (especially with the +1hr shift).
+  # to fill a full Local Standard Time day.
   start_fetch <- start_date - days(1)
   end_fetch <- end_date + days(2)
   
@@ -372,10 +372,11 @@ fetch_process_iem_hourly_met <- function(station_call_sign, station_state, start
         # Process and convert units
         met_data <- met_data_raw %>%
           mutate(
-            valid_dt = lubridate::as_datetime(valid, tz = "UTC"),
-            # STRICT HOUR ENDING: An observation at :54 belongs to the hour ending soon.
-            # Add 10 minutes then floor to ensure :54 moves to the next top-of-hour.
-            date = lubridate::floor_date(valid_dt + lubridate::minutes(10), unit = "hour")
+            valid_dt = lubridate::as_datetime(valid, tz = "UTC"),  # IEM 'valid' is UTC (tz=Etc/UTC above)
+            # HOUR BEGINNING, like AirNow: the 04:54 report was observed during the
+            # 04:00-04:59 hour, so it pairs with the 04:00 pollutant row. worldmet labels
+            # NOAA ISD reports the same way (cut(date, "hour")).
+            date = lubridate::floor_date(valid_dt, unit = "hour")
           ) %>%
           filter(!is.na(date)) %>%
           mutate(
@@ -409,8 +410,8 @@ fetch_process_iem_hourly_met <- function(station_call_sign, station_state, start
 # CACHING Helper for MET Data
 fetch_and_cache_met_data <- function(met_code, start_d, end_d, data_type_mode, site_info, plot_dir, met_state_abbr, rv_log_update) {
   # Generate a unique key for this request
-  # version: v3_StrictHourEnding
-  cache_key <- digest::digest(list("v3_StrictHourEnding", met_code, start_d, end_d, data_type_mode, met_state_abbr))
+  # version: v4_HourBeginning (weather cached under the old +1 h labels is not reused)
+  cache_key <- digest::digest(list("v4_HourBeginning", met_code, start_d, end_d, data_type_mode, met_state_abbr))
   cache_dir <- "app_cache"
   dir.create(cache_dir, showWarnings = FALSE)
   cache_file <- file.path(cache_dir, paste0(cache_key, ".rds"))
@@ -1703,25 +1704,28 @@ server <- function(input, output, session) {
       }, error = function(e) NA_real_)
 
       # --- 5. TIME CONVERSION & SYNCHRONIZATION ---
-      rv$status_log <- tail(c(rv$status_log, "3. Synchronizing Hourly Timestamps..."), 20)
+      rv$status_log <- tail(c(rv$status_log, "3. Synchronizing Timestamps to Local Standard Time..."), 20)
       
-      # 5a. Process Pollutants to LST (Standard Time)
-      poll_data_result <- poll_data_result %>%
-        mutate(date = lubridate::with_tz(date, tzone = site_info$tz))
-      
-      # 5b. Process MET to LST and Align to Hour-Ending (STRICT FORWARD SHIFT)
-      # Pollutants (AQS) are "Hour Ending" (e.g. 01:00 is the 00:00-01:00 avg).
-      # MET (ASOS) are "Snapshots" (e.g. 00:54 happens during that same hour).
-      # To align them, we MUST label the 00:54 weather as the "01:00" row.
-      met_data_result <- met_data_result %>%
-        mutate(
-          # 1. Convert UTC to Local Standard Time
-          date_lst = lubridate::with_tz(date, tzone = site_info$tz),
-          # 2. Add 1 Hour to convert "Hour Snapshot" to "Hour Ending" label
-          # This moves 12:54 AM to 1:54 AM.
-          # 3. Floor to the top of the hour to match the Ozone label (01:00).
-          date = lubridate::floor_date(date_lst + lubridate::hours(1), unit = "hour")
-        )
+      if (data_type_mode == "hourly") {
+        # AirNow hourly times are GMT and mark the BEGINNING of the hour (AirNow Hourly
+        # Data File fact sheet): the 05:00 LST row is the 05:00-05:59 average. Both
+        # weather sources are already labelled the same way (the 05:54 report -> 05:00),
+        # so a plain UTC -> LST conversion pairs each hour with the weather observed in it.
+        # (For hour-ending labels, add 1 h to the merged date after the join.)
+        poll_data_result <- poll_data_result %>%
+          mutate(date = lubridate::with_tz(date, tzone = site_info$tz))
+        met_data_result <- met_data_result %>%
+          mutate(date = lubridate::with_tz(date, tzone = site_info$tz))
+      } else {
+        # Daily values are already local-standard-time calendar days: AirNow's
+        # "Valid date" is the local date (midnight-to-midnight LST), and IEM's ASOS
+        # daily summaries use standard-time days. Anchor both at LST midnight; reading
+        # a Date as UTC midnight would move every value to the evening before.
+        poll_data_result <- poll_data_result %>%
+          mutate(date = as.POSIXct(format(as.Date(date)), tz = site_info$tz))
+        met_data_result <- met_data_result %>%
+          mutate(date = as.POSIXct(format(as.Date(date)), tz = site_info$tz))
+      }
 
       # --- 6. MERGE DATA ---
       merged_data_result <- tryCatch(left_join(poll_data_result, met_data_result, by = "date"), error = function(e) NULL)
